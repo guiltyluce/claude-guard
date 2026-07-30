@@ -1,5 +1,14 @@
 # Roadmap
 
+## v2.0.2
+
+启动前门禁视觉升级。
+
+- 交互 TTY 显示 8 步进度条和通过、警告、阻挡状态。
+- 非 TTY 与重定向输出保持旧版纯文字契约。
+- 支持 `CLAUDE_GUARD_UI`、`NO_COLOR` 和 ASCII 回退。
+- 不改变 fail-closed 条件、退出码、路由、网络探测或 watchdog。
+
 ## v2.0.1
 
 恢复 session 连续性作为默认升级策略。

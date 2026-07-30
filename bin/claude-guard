@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="2.0.1"
+VERSION="2.0.2"
 
 CONFIG_FILE="${CLAUDE_GUARD_CONFIG:-${SAFE_CLAUDE_CONFIG:-$HOME/.safe-claude-official.json}}"
 OFFICIAL_SETTINGS_OVERRIDE="${CLAUDE_GUARD_SETTINGS:-}"
@@ -32,6 +32,26 @@ FINGERPRINT_MODE="${CLAUDE_GUARD_FINGERPRINT_MODE:-fail-active}"
 LEGACY_PROFILE_MODE="${CLAUDE_GUARD_LEGACY_PROFILE_MODE:-warn}"
 SETTINGS_RISK_RE='ANTHROPIC_(BASE_URL|AUTH_TOKEN|API_KEY|CUSTOM_HEADERS|AWS_BASE_URL|BEDROCK_BASE_URL|VERTEX_BASE_URL|FOUNDRY_BASE_URL)|apiKeyHelper|PROXY_MANAGED|CLAUDE_CODE_USE_(GATEWAY|BEDROCK|VERTEX|FOUNDRY|ANTHROPIC_AWS|MANTLE)|CLAUDE_CODE_PROCESS_WRAPPER|processWrapper|CLAUDE_CODE_RETRY_WATCHDOG|CLAUDE_CODE_ATTRIBUTION_HEADER|HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|NODE_EXTRA_CA_CERTS|SSL_CERT_FILE|CLAUDE_CODE_CERT_STORE|CLAUDE_CONFIG_DIR'
 PRECHECK_ONLY=0
+UI_MODE="${CLAUDE_GUARD_UI:-auto}"
+UI_ENABLED=0
+UI_DYNAMIC=0
+UI_UNICODE=0
+UI_TOTAL=8
+UI_INDEX=0
+UI_CURRENT_STEP=""
+UI_STEP_NOTES=""
+UI_STEP_WARNINGS=""
+UI_STEP_WARNING_COUNT=0
+UI_WARNING_TOTAL=0
+UI_STARTED=0
+UI_COMPLETE=0
+UI_STARTED_AT=0
+UI_RED=""
+UI_GREEN=""
+UI_YELLOW=""
+UI_CYAN=""
+UI_DIM=""
+UI_RESET=""
 
 usage() {
   cat <<'EOF'
@@ -49,6 +69,9 @@ Environment:
   CLAUDE_GUARD_NO_PROXY      NO_PROXY list. Default: 127.0.0.1,localhost,::1,.local
   CLAUDE_GUARD_ASSUME_YES    Set to 1 to skip the final Enter prompt when IP is allowed.
   CLAUDE_GUARD_IP_CHECK_URLS Space-separated IPv4 echo endpoints.
+  CLAUDE_GUARD_UI             auto, always, or never. Default: auto.
+                              auto renders the visual preflight only in an interactive terminal.
+  NO_COLOR                   Disable ANSI colors while keeping the visual preflight layout.
   CLAUDE_GUARD_WATCHDOG      Set to 0 to disable runtime guarding. Default: 1
   CLAUDE_GUARD_WATCHDOG_DRY_RUN
                               Default: 1. Logs would-pause/would-resume actions only.
@@ -113,6 +136,239 @@ require_cmd() {
 
 require_cmd curl
 require_cmd jq
+
+configure_ui() {
+  case "$UI_MODE" in
+    auto)
+      if [ -t 2 ] && [ "${TERM:-}" != "dumb" ]; then
+        UI_ENABLED=1
+      fi
+      ;;
+    always)
+      UI_ENABLED=1
+      ;;
+    never)
+      UI_ENABLED=0
+      ;;
+    *)
+      printf 'CLAUDE_GUARD_UI 只能是 auto、always 或 never，当前是: %s\n' "$UI_MODE" >&2
+      exit 2
+      ;;
+  esac
+
+  if [ "$UI_ENABLED" -eq 1 ] && [ -t 2 ] && [ "${TERM:-}" != "dumb" ]; then
+    UI_DYNAMIC=1
+  fi
+
+  if [ "$UI_ENABLED" -eq 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-}" != "dumb" ]; then
+    UI_RED=$'\033[31m'
+    UI_GREEN=$'\033[32m'
+    UI_YELLOW=$'\033[33m'
+    UI_CYAN=$'\033[36m'
+    UI_DIM=$'\033[2m'
+    UI_RESET=$'\033[0m'
+  fi
+
+  case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
+    *[Uu][Tt][Ff]-8*|*[Uu][Tt][Ff]8*) UI_UNICODE=1 ;;
+  esac
+}
+
+ui_progress_bar() {
+  local completed="$1"
+  local width=16
+  local filled empty i bar=""
+
+  filled=$((completed * width / UI_TOTAL))
+  empty=$((width - filled))
+  i=0
+  while [ "$i" -lt "$filled" ]; do
+    if [ "$UI_UNICODE" -eq 1 ]; then
+      bar="${bar}█"
+    else
+      bar="${bar}#"
+    fi
+    i=$((i + 1))
+  done
+  i=0
+  while [ "$i" -lt "$empty" ]; do
+    if [ "$UI_UNICODE" -eq 1 ]; then
+      bar="${bar}░"
+    else
+      bar="${bar}-"
+    fi
+    i=$((i + 1))
+  done
+  printf '%s' "$bar"
+}
+
+ui_icon() {
+  local kind="$1"
+
+  if [ "$UI_UNICODE" -eq 1 ]; then
+    case "$kind" in
+      pass) printf '✓' ;;
+      warn) printf '!' ;;
+      fail) printf '×' ;;
+      active) printf '…' ;;
+    esac
+  else
+    case "$kind" in
+      pass) printf 'OK' ;;
+      warn) printf '!' ;;
+      fail) printf 'X' ;;
+      active) printf '..' ;;
+    esac
+  fi
+}
+
+ui_header() {
+  local title_separator="-"
+
+  [ "$UI_ENABLED" -eq 1 ] || return 0
+  [ "$UI_UNICODE" -eq 1 ] && title_separator="·"
+  UI_STARTED=1
+  UI_STARTED_AT="$SECONDS"
+  printf '\n%sClaude Guard %s Official Preflight%s  %sv%s%s\n' \
+    "$UI_CYAN" "$title_separator" "$UI_RESET" "$UI_DIM" "$VERSION" "$UI_RESET" >&2
+  printf '%s  profile  %s%s\n' "$UI_DIM" "$OFFICIAL_CONFIG_DIR" "$UI_RESET" >&2
+  printf '%s  route    %s%s\n\n' "$UI_DIM" "$CLAUDE_PROXY_URL" "$UI_RESET" >&2
+  trap 'ui_exit_trap "$?"' EXIT
+}
+
+ui_step_start() {
+  local label="$1"
+  local bar icon
+
+  UI_INDEX=$((UI_INDEX + 1))
+  UI_CURRENT_STEP="$label"
+  UI_STEP_NOTES=""
+  UI_STEP_WARNINGS=""
+  UI_STEP_WARNING_COUNT=0
+  [ "$UI_ENABLED" -eq 1 ] || return 0
+
+  bar="$(ui_progress_bar "$UI_INDEX")"
+  icon="$(ui_icon active)"
+  printf '  %s%s%s  [%s] %s/%s  %s\n' \
+    "$UI_CYAN" "$icon" "$UI_RESET" "$bar" "$UI_INDEX" "$UI_TOTAL" "$label" >&2
+}
+
+ui_note() {
+  local format="$1"
+  local message
+  shift
+
+  # shellcheck disable=SC2059
+  printf -v message "$format" "$@"
+  if [ "$UI_ENABLED" -eq 1 ]; then
+    if [ -n "$UI_STEP_NOTES" ]; then
+      UI_STEP_NOTES="${UI_STEP_NOTES}"$'\n'"$message"
+    else
+      UI_STEP_NOTES="$message"
+    fi
+  else
+    printf '%s\n' "$message"
+  fi
+}
+
+ui_visual_note() {
+  [ "$UI_ENABLED" -eq 1 ] || return 0
+  ui_note "$@"
+}
+
+ui_warn() {
+  local format="$1"
+  local message
+  shift
+
+  # shellcheck disable=SC2059
+  printf -v message "$format" "$@"
+  if [ "$UI_ENABLED" -eq 1 ]; then
+    if [ -n "$UI_STEP_WARNINGS" ]; then
+      UI_STEP_WARNINGS="${UI_STEP_WARNINGS}"$'\n'"$message"
+    else
+      UI_STEP_WARNINGS="$message"
+    fi
+    UI_STEP_WARNING_COUNT=$((UI_STEP_WARNING_COUNT + 1))
+    UI_WARNING_TOTAL=$((UI_WARNING_TOTAL + 1))
+  else
+    printf '%s\n' "$message" >&2
+  fi
+}
+
+ui_render_detail() {
+  local kind="$1"
+  local content="$2"
+  local color="$UI_DIM"
+  local prefix=" "
+  local line
+
+  [ -n "$content" ] || return 0
+  if [ "$kind" = "warn" ]; then
+    color="$UI_YELLOW"
+    prefix="!"
+  fi
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    printf '      %s%s %s%s\n' "$color" "$prefix" "$line" "$UI_RESET" >&2
+  done <<EOF
+$content
+EOF
+}
+
+ui_step_finish() {
+  local bar icon color status="pass"
+
+  [ "$UI_ENABLED" -eq 1 ] || return 0
+  if [ "$UI_STEP_WARNING_COUNT" -gt 0 ]; then
+    status="warn"
+  fi
+
+  bar="$(ui_progress_bar "$UI_INDEX")"
+  icon="$(ui_icon "$status")"
+  color="$UI_GREEN"
+  [ "$status" = "warn" ] && color="$UI_YELLOW"
+
+  if [ "$UI_DYNAMIC" -eq 1 ]; then
+    printf '\033[1A\r\033[2K' >&2
+  fi
+  printf '  %s%s%s  [%s] %s/%s  %s\n' \
+    "$color" "$icon" "$UI_RESET" "$bar" "$UI_INDEX" "$UI_TOTAL" "$UI_CURRENT_STEP" >&2
+  ui_render_detail note "$UI_STEP_NOTES"
+  ui_render_detail warn "$UI_STEP_WARNINGS"
+}
+
+ui_finish() {
+  local elapsed=0
+  local icon message
+
+  UI_COMPLETE=1
+  [ "$UI_ENABLED" -eq 1 ] || return 0
+  elapsed=$((SECONDS - UI_STARTED_AT))
+  icon="$(ui_icon pass)"
+  message="预检已通过"
+  if [ "$UI_WARNING_TOTAL" -gt 0 ]; then
+    message="${message}，含 ${UI_WARNING_TOTAL} 条警告"
+  fi
+  printf '\n  %s%s  %s%s  %s8/8%s  %s%ss%s\n' \
+    "$UI_GREEN" "$icon" "$message" "$UI_RESET" \
+    "$UI_DIM" "$UI_RESET" "$UI_DIM" "$elapsed" "$UI_RESET" >&2
+}
+
+ui_exit_trap() {
+  local status="$1"
+  local icon
+
+  if [ "$UI_ENABLED" -eq 1 ] && [ "$UI_STARTED" -eq 1 ] &&
+     [ "$UI_COMPLETE" -ne 1 ] && [ "$status" -ne 0 ]; then
+    icon="$(ui_icon fail)"
+    printf '\n  %s%s  预检未通过%s  %s%s/%s · %s · exit=%s%s\n' \
+      "$UI_RED" "$icon" "$UI_RESET" "$UI_DIM" "$UI_INDEX" "$UI_TOTAL" \
+      "${UI_CURRENT_STEP:-初始化}" "$status" "$UI_RESET" >&2
+  fi
+}
+
+configure_ui
 
 resolve_path() {
   local path="$1"
@@ -223,7 +479,7 @@ check_client_identity() {
     team="unpinned"
   fi
 
-  printf '客户端身份校验通过：version=%s sha256=%s team=%s\n' \
+  ui_note '客户端身份校验通过：version=%s sha256=%s team=%s' \
     "$actual_version" "${actual_sha:0:12}" "$team"
 }
 
@@ -321,7 +577,7 @@ check_official_settings_policy() {
   fi
 
   check_blocked_plugins "$OFFICIAL_SETTINGS" "官方 settings"
-  printf '生命周期策略通过：后台会话、后台任务、排程、工作流、Remote Control 与自动更新均已关闭。\n'
+  ui_note '生命周期策略通过：后台会话、后台任务、排程、工作流、Remote Control 与自动更新均已关闭。'
 }
 
 project_settings_files() {
@@ -460,7 +716,7 @@ check_tls_host() {
               reason="${host} 的证书 issuer 疑似代理/MITM: ${issuer}"
               ;;
             *)
-              printf 'TLS 预检通过：%s via %s issuer=%s\n' "$host" "$CLAUDE_PROXY_URL" "$issuer"
+              ui_note 'TLS 预检通过：%s via %s issuer=%s' "$host" "$CLAUDE_PROXY_URL" "$issuer"
               return 0
               ;;
           esac
@@ -471,15 +727,20 @@ check_tls_host() {
     fi
 
     if [ "$attempt" -lt "$TLS_CHECK_RETRIES" ]; then
-      printf 'TLS 预检重试：%s 第 %s/%s 次失败：%s\n' "$host" "$attempt" "$TLS_CHECK_RETRIES" "$reason" >&2
+      ui_warn 'TLS 预检重试：%s 第 %s/%s 次失败：%s' "$host" "$attempt" "$TLS_CHECK_RETRIES" "$reason"
       sleep 1
     fi
     attempt=$((attempt + 1))
   done
 
   if [ "$mode" = "warn" ]; then
-    printf 'TLS 预检警告：%s 经过 %s 次尝试仍未稳定通过：%s\n' "$host" "$TLS_CHECK_RETRIES" "$reason" >&2
-    printf '%s\n' "$out" | grep -Ei 'certificate|issuer|subject|SSL|error|CONNECT' >&2 || true
+    ui_warn 'TLS 预检警告：%s 经过 %s 次尝试仍未稳定通过：%s' "$host" "$TLS_CHECK_RETRIES" "$reason"
+    if [ "$UI_ENABLED" -eq 1 ]; then
+      out="$(printf '%s\n' "$out" | grep -Ei 'certificate|issuer|subject|SSL|error|CONNECT' || true)"
+      [ -z "$out" ] || ui_note '%s' "$out"
+    else
+      printf '%s\n' "$out" | grep -Ei 'certificate|issuer|subject|SSL|error|CONNECT' >&2 || true
+    fi
     return 0
   fi
 
@@ -495,11 +756,11 @@ check_anthropic_ipv6_blocked() {
     remote_ip="$(printf '%s\n' "$out" | sed -n 's/.*remote_ip=\([^ ]*\).*/\1/p')"
     case "$remote_ip" in
       ::ffff:198.18.*|::ffff:198.19.*|198.18.*|198.19.*)
-        printf 'IPv6 预检通过：api.anthropic.com 仅返回 Mihomo/Clash fake-ip 映射 %s，不是公网 IPv6 出口。\n' "$remote_ip"
+        ui_note 'IPv6 预检通过：api.anthropic.com 仅返回 Mihomo/Clash fake-ip 映射 %s，不是公网 IPv6 出口。' "$remote_ip"
         return 0
         ;;
       ::ffff:*)
-        printf 'IPv6 预检通过：api.anthropic.com 返回 IPv4-mapped 地址 %s，不是公网 IPv6 出口。\n' "$remote_ip"
+        ui_note 'IPv6 预检通过：api.anthropic.com 返回 IPv4-mapped 地址 %s，不是公网 IPv6 出口。' "$remote_ip"
         return 0
         ;;
     esac
@@ -509,7 +770,7 @@ check_anthropic_ipv6_blocked() {
     exit 8
   fi
 
-  printf 'IPv6 预检通过：api.anthropic.com IPv6 不可达，Claude 官方链路将压在 IPv4。\n'
+  ui_note 'IPv6 预检通过：api.anthropic.com IPv6 不可达，Claude 官方链路将压在 IPv4。'
 }
 
 log_guard() {
@@ -610,7 +871,7 @@ check_legacy_profile_contamination() {
     exit 11
   fi
 
-  printf '旧默认 Claude profile 命中反代/凭据注入残留，但官方入口使用 CLAUDE_CONFIG_DIR=%s，按 warn 模式继续。\n' "$OFFICIAL_CONFIG_DIR" >&2
+  ui_warn '旧默认 Claude profile 命中反代/凭据注入残留，但官方入口使用 CLAUDE_CONFIG_DIR=%s，按 warn 模式继续。' "$OFFICIAL_CONFIG_DIR"
   log_guard "WARN" "legacy profile contains proxy/auth markers path=${profile}; official profile remains isolated"
 }
 
@@ -635,7 +896,7 @@ check_client_fingerprint_tripwire() {
   fi
 
   if [ "$marker_found" -ne 1 ]; then
-    printf '客户端指纹预检通过：未发现已知 date/time watermark 逻辑。\n'
+    ui_note '客户端指纹预检通过：未发现已知 date/time watermark 逻辑。'
     return 0
   fi
 
@@ -663,12 +924,12 @@ check_client_fingerprint_tripwire() {
       printf '请清理 ANTHROPIC_BASE_URL 或改用干净 timezone/profile 后再启动官方 Claude。\n' >&2
       exit 10
     fi
-    printf '客户端指纹预检警告：%s 含有已知 date/time watermark 逻辑，且存在激活条件:%s\n' "$marker_file" "$active_reasons" >&2
+    ui_warn '客户端指纹预检警告：%s 含有已知 date/time watermark 逻辑，且存在激活条件:%s' "$marker_file" "$active_reasons"
     log_guard "WARN" "watermark-capable client with active conditions:${active_reasons}"
     return 0
   fi
 
-  printf '客户端指纹预检警告：%s 含有已知 date/time watermark 逻辑，但当前官方环境未发现激活条件，继续。\n' "$marker_file" >&2
+  ui_warn '客户端指纹预检警告：%s 含有已知 date/time watermark 逻辑，但当前官方环境未发现激活条件，继续。' "$marker_file"
   log_guard "WARN" "watermark-capable client detected without active conditions path=${marker_file}"
 }
 
@@ -986,14 +1247,25 @@ if [ ! -f "$CA_CERT_FILE" ]; then
   exit 2
 fi
 
+ui_header
+
+ui_step_start "配置与生命周期"
 check_official_settings_policy
+ui_step_finish
+
+ui_step_start "项目与参数边界"
 check_project_settings_policy
 check_cli_policy "$@"
 check_model_policy "$@"
+ui_step_finish
+
+ui_step_start "客户端身份与指纹"
 check_client_identity "$CLAUDE_BIN"
 check_legacy_profile_contamination
 check_client_fingerprint_tripwire "$CLAUDE_BIN"
+ui_step_finish
 
+ui_step_start "出口 IP 获取"
 attempt=1
 CURRENT_IP=''
 while [ "$attempt" -le "$IP_CHECK_RETRIES" ]; do
@@ -1001,7 +1273,7 @@ while [ "$attempt" -le "$IP_CHECK_RETRIES" ]; do
     break
   fi
   if [ "$attempt" -lt "$IP_CHECK_RETRIES" ]; then
-    printf 'IP 检查重试：第 %s/%s 次无法从任一 IP 源获取有效 IPv4。\n' "$attempt" "$IP_CHECK_RETRIES" >&2
+    ui_warn 'IP 检查重试：第 %s/%s 次无法从任一 IP 源获取有效 IPv4。' "$attempt" "$IP_CHECK_RETRIES"
     sleep 1
   fi
   attempt=$((attempt + 1))
@@ -1010,16 +1282,33 @@ if [ -z "$CURRENT_IP" ]; then
   printf 'IP 检查失败：无法获取当前出口 IP。\n' >&2
   exit 3
 fi
+ui_visual_note '出口 IP 已获取：%s' "$CURRENT_IP"
+ui_step_finish
 
-printf 'Claude Official 网络路径：%s，NO_PROXY=%s\n' "$CLAUDE_PROXY_URL" "$NO_PROXY_LIST"
+ui_step_start "Anthropic API TLS"
+ui_note 'Claude Official 网络路径：%s，NO_PROXY=%s' "$CLAUDE_PROXY_URL" "$NO_PROXY_LIST"
 check_tls_host api.anthropic.com
-check_tls_host platform.claude.com "$PLATFORM_TLS_MODE"
-check_anthropic_ipv6_blocked
+ui_step_finish
 
+ui_step_start "Claude 登录 TLS"
+check_tls_host platform.claude.com "$PLATFORM_TLS_MODE"
+ui_step_finish
+
+ui_step_start "IPv6 泄漏"
+check_anthropic_ipv6_blocked
+ui_step_finish
+
+ui_step_start "出口白名单"
 if is_allowed_ip "$CURRENT_IP"; then
-  printf 'IP 检查通过：%s\n' "$CURRENT_IP"
+  ui_note 'IP 检查通过：%s' "$CURRENT_IP"
+  ui_step_finish
+  ui_finish
   if [ "$PRECHECK_ONLY" = "1" ]; then
-    printf '预检完成：未启动 Claude。\n'
+    if [ "$UI_ENABLED" -eq 1 ]; then
+      printf '  %sprecheck-only：未启动 Claude。%s\n' "$UI_DIM" "$UI_RESET" >&2
+    else
+      printf '预检完成：未启动 Claude。\n'
+    fi
     exit 0
   fi
   if [ "$ASSUME_YES" != "1" ]; then

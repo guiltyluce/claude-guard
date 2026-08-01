@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="2.0.3"
+VERSION="2.0.4"
 
 CONFIG_FILE="${CLAUDE_GUARD_CONFIG:-${SAFE_CLAUDE_CONFIG:-$HOME/.safe-claude-official.json}}"
 OFFICIAL_SETTINGS_OVERRIDE="${CLAUDE_GUARD_SETTINGS:-}"
@@ -28,12 +28,18 @@ RESUME_GOOD_THRESHOLD="${CLAUDE_GUARD_RESUME_GOOD_THRESHOLD:-2}"
 KILL_AFTER_PAUSE_SECONDS="${CLAUDE_GUARD_KILL_AFTER_PAUSE_SECONDS:-}"
 LOG_FILE="${CLAUDE_GUARD_LOG_FILE:-$HOME/.claude-guard/guard.log}"
 LOG_MAX_BYTES="${CLAUDE_GUARD_LOG_MAX_BYTES:-1048576}"
+NOTIFY_OVERRIDE_SET=0
+if [ "${CLAUDE_GUARD_NOTIFY+x}" = "x" ]; then
+  NOTIFY_OVERRIDE_SET=1
+fi
 NOTIFY_ENABLED="${CLAUDE_GUARD_NOTIFY:-0}"
 DRY_RUN_STDERR="${CLAUDE_GUARD_DRY_RUN_STDERR:-0}"
 FINGERPRINT_MODE="${CLAUDE_GUARD_FINGERPRINT_MODE:-fail-active}"
 LEGACY_PROFILE_MODE="${CLAUDE_GUARD_LEGACY_PROFILE_MODE:-warn}"
 SETTINGS_RISK_RE='ANTHROPIC_(BASE_URL|AUTH_TOKEN|API_KEY|CUSTOM_HEADERS|AWS_BASE_URL|BEDROCK_BASE_URL|VERTEX_BASE_URL|FOUNDRY_BASE_URL)|apiKeyHelper|PROXY_MANAGED|CLAUDE_CODE_USE_(GATEWAY|BEDROCK|VERTEX|FOUNDRY|ANTHROPIC_AWS|MANTLE)|CLAUDE_CODE_PROCESS_WRAPPER|processWrapper|CLAUDE_CODE_RETRY_WATCHDOG|CLAUDE_CODE_ATTRIBUTION_HEADER|HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|NODE_EXTRA_CA_CERTS|SSL_CERT_FILE|CLAUDE_CODE_CERT_STORE|CLAUDE_CONFIG_DIR'
 PRECHECK_ONLY=0
+COMMAND_MODE="run"
+STATUS_JSON=0
 UI_MODE="${CLAUDE_GUARD_UI:-auto}"
 UI_ENABLED=0
 UI_DYNAMIC=0
@@ -61,6 +67,9 @@ Claude 守护 - startup guard for official Claude Code
 
 Usage:
   claude-guard [--precheck-only] [claude args...]
+  claude-guard status [--json]
+  claude-guard doctor
+  claude-guard diagnose
   claude-guard --version
   claude-guard --help
 
@@ -87,6 +96,8 @@ Environment:
                               off, warn, or strict for ~/.claude contamination. Default: warn.
   CLAUDE_GUARD_LOG_FILE      Default: ~/.claude-guard/guard.log
   CLAUDE_GUARD_LOG_MAX_BYTES Rotate to guard.log.1 after this size. Default: 1048576.
+  CLAUDE_GUARD_NOTIFY        Set to 1 for macOS pause/resume notifications.
+                              If unset, reads boolean `notify` from the safe config. Default: off.
 
 Lifecycle policy:
   Background agents, background tasks, cron, workflows, Remote Control,
@@ -103,6 +114,38 @@ The config file must contain:
   }
 EOF
 }
+
+case "${1:-}" in
+  status)
+    COMMAND_MODE="status"
+    shift
+    if [ "${1:-}" = "--json" ]; then
+      STATUS_JSON=1
+      shift
+    fi
+    if [ "$#" -gt 0 ]; then
+      printf 'status 不接受额外参数: %s\n' "$*" >&2
+      exit 2
+    fi
+    ;;
+  doctor)
+    COMMAND_MODE="doctor"
+    PRECHECK_ONLY=1
+    shift
+    if [ "$#" -gt 0 ]; then
+      printf 'doctor 不接受额外参数: %s\n' "$*" >&2
+      exit 2
+    fi
+    ;;
+  diagnose)
+    COMMAND_MODE="diagnose"
+    shift
+    if [ "$#" -gt 0 ]; then
+      printf 'diagnose 不接受额外参数: %s\n' "$*" >&2
+      exit 2
+    fi
+    ;;
+esac
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -139,8 +182,11 @@ require_cmd() {
   fi
 }
 
-require_cmd curl
 require_cmd jq
+case "$COMMAND_MODE" in
+  status|diagnose) ;;
+  *) require_cmd curl ;;
+esac
 
 configure_ui() {
   case "$UI_MODE" in
@@ -828,6 +874,370 @@ notify_guard() {
   osascript -e "display notification \"${message//\"/\\\"}\" with title \"Claude Guardian\"" >/dev/null 2>&1 || true
 }
 
+resolve_notification_setting() {
+  local config_valid="${1:-0}"
+  local configured="0"
+
+  if [ "$NOTIFY_OVERRIDE_SET" -eq 1 ]; then
+    configured="$NOTIFY_ENABLED"
+  elif [ "$config_valid" -eq 1 ]; then
+    if jq -e 'has("notify") and (.notify | type != "boolean")' "$CONFIG_FILE" >/dev/null; then
+      printf '配置中的 notify 必须是 true 或 false。\n' >&2
+      return 2
+    fi
+    configured="$(jq -r 'if .notify == true then "1" else "0" end' "$CONFIG_FILE")"
+  fi
+
+  case "$configured" in
+    0|1) NOTIFY_ENABLED="$configured" ;;
+    *)
+      printf 'CLAUDE_GUARD_NOTIFY 只能是 0 或 1，当前是: %s\n' "$configured" >&2
+      return 2
+      ;;
+  esac
+}
+
+load_visibility_config() {
+  VISIBILITY_CONFIG_STATE="missing"
+  VISIBILITY_CLAUDE_BIN=""
+  VISIBILITY_PROFILE="$HOME/.claude-official"
+
+  if [ -f "$CONFIG_FILE" ]; then
+    if jq -e 'type == "object"' "$CONFIG_FILE" >/dev/null 2>&1; then
+      VISIBILITY_CONFIG_STATE="valid"
+      VISIBILITY_CLAUDE_BIN="$(jq -r '.command // empty' "$CONFIG_FILE")"
+      VISIBILITY_PROFILE="$(jq -r '.config_dir // empty' "$CONFIG_FILE")"
+      [ -n "$VISIBILITY_PROFILE" ] || VISIBILITY_PROFILE="$HOME/.claude-official"
+      if [ -z "$VISIBILITY_CLAUDE_BIN" ]; then
+        VISIBILITY_CONFIG_STATE="incomplete"
+      fi
+      resolve_notification_setting 1
+    else
+      VISIBILITY_CONFIG_STATE="invalid"
+      resolve_notification_setting 0
+    fi
+  else
+    resolve_notification_setting 0
+  fi
+}
+
+visibility_display_path() {
+  local path="$1"
+
+  case "$path" in
+    "$HOME") printf '~\n' ;;
+    "$HOME"/*) printf '~%s\n' "${path#"$HOME"}" ;;
+    *) printf '%s\n' "$path" ;;
+  esac
+}
+
+visibility_log_stream() {
+  if [ -f "${LOG_FILE}.1" ]; then
+    cat "${LOG_FILE}.1" 2>/dev/null || true
+  fi
+  if [ -f "$LOG_FILE" ]; then
+    cat "$LOG_FILE" 2>/dev/null || true
+  fi
+  return 0
+}
+
+visibility_process_rows() {
+  local claude_bin="$1"
+  local snapshot
+
+  [ -n "$claude_bin" ] || return 0
+  snapshot="$(ps -axo pid=,ppid=,pgid=,args= 2>/dev/null || true)"
+  printf '%s\n' "$snapshot" | awk -v bin="$claude_bin" '
+    {
+      count += 1
+      pid[count] = $1
+      ppid[count] = $2
+      pgid[count] = $3
+      line[count] = $0
+    }
+    END {
+      for (i = 1; i <= count; i += 1) {
+        if (index(line[i], bin) > 0) {
+          claude[pid[i]] = 1
+        }
+      }
+      for (i = 1; i <= count; i += 1) {
+        if (claude[ppid[i]] && line[i] ~ / bash .*claude-guard( |$)/) {
+          watchdog[ppid[i]] += 1
+        }
+      }
+      for (i = 1; i <= count; i += 1) {
+        if (claude[pid[i]]) {
+          printf "%s\t%s\t%s\n", pid[i], pgid[i], (watchdog[pid[i]] > 0 ? 1 : 0)
+        }
+      }
+    }
+  ' | sort -n
+}
+
+visibility_state_for_pid() {
+  local target_pid="$1"
+  local line state timestamp
+
+  line="$(visibility_log_stream | awk -v pid="$target_pid" '
+    $0 ~ ("pid=" pid "([^0-9]|$)") { last = $0 }
+    END { print last }
+  ')"
+  timestamp="-"
+  state="unknown"
+  if [ -n "$line" ]; then
+    timestamp="${line%% *}"
+    case "$line" in
+      *"would resume Claude"*|*"route healthy"*) state="healthy" ;;
+      *"resume candidate"*) state="recovering" ;;
+      *"would pause Claude"*) state="would-pause" ;;
+      *"exit ip unavailable"*|*"exit ip not allowed"*|*"api path unhealthy"*|*"wake gap detected"*) state="degraded" ;;
+      *"watchdog exited"*) state="exited" ;;
+      *"watchdog started"*) state="observing" ;;
+    esac
+  fi
+  printf '%s|%s\n' "$state" "$timestamp"
+}
+
+visibility_session_rows() {
+  local base_rows target_pid pgid watchdog state_info state timestamp
+
+  base_rows="$(visibility_process_rows "$VISIBILITY_CLAUDE_BIN")"
+  [ -n "$base_rows" ] || return 0
+  while IFS=$'\t' read -r target_pid pgid watchdog; do
+    [ -n "$target_pid" ] || continue
+    state_info="$(visibility_state_for_pid "$target_pid")"
+    state="${state_info%%|*}"
+    timestamp="${state_info#*|}"
+    printf '%s\t%s\t%s\t%s\t%s\n' \
+      "$target_pid" "$pgid" "$watchdog" "$state" "$timestamp"
+  done <<EOF
+$base_rows
+EOF
+}
+
+visibility_last_event() {
+  local pattern="$1"
+
+  visibility_log_stream | awk -v pattern="$pattern" '
+    $0 ~ pattern { last = $0 }
+    END { print last }
+  '
+}
+
+visibility_log_bytes() {
+  local bytes=0 size
+
+  if [ -f "${LOG_FILE}.1" ]; then
+    size="$(wc -c 2>/dev/null <"${LOG_FILE}.1" | tr -d '[:space:]')" || size=0
+    bytes=$((bytes + ${size:-0}))
+  fi
+  if [ -f "$LOG_FILE" ]; then
+    size="$(wc -c 2>/dev/null <"$LOG_FILE" | tr -d '[:space:]')" || size=0
+    bytes=$((bytes + ${size:-0}))
+  fi
+  printf '%s\n' "$bytes"
+}
+
+visibility_sessions_json() {
+  local rows="$1"
+
+  printf '%s\n' "$rows" | jq -R -s '
+    split("\n")
+    | map(select(length > 0) | split("\t"))
+    | map({
+        pid: (.[0] | tonumber),
+        pgid: (.[1] | tonumber),
+        watchdog: (.[2] == "1"),
+        state: .[3],
+        last_event_at: .[4]
+      })
+  '
+}
+
+print_status_report() {
+  local rows sessions_json active_count watchdog_count mode mode_label notify_label health health_label
+  local profile_display log_display log_bytes last_incident last_recovery
+
+  load_visibility_config
+  rows="$(visibility_session_rows)"
+  active_count="$(printf '%s\n' "$rows" | awk 'NF { count += 1 } END { print count + 0 }')"
+  watchdog_count="$(printf '%s\n' "$rows" | awk -F '\t' 'NF { count += $3 } END { print count + 0 }')"
+  mode="action-refused"
+  mode_label="action requested (refused at launch)"
+  if [ "$WATCHDOG_DRY_RUN" = "1" ]; then
+    mode="dry-run"
+    mode_label="dry-run observation"
+  fi
+  notify_label="disabled"
+  [ "$NOTIFY_ENABLED" = "1" ] && notify_label="enabled"
+  health="idle"
+  health_label="IDLE"
+  if [ "$active_count" -gt 0 ]; then
+    health="ok"
+    health_label="OK"
+    if [ "$watchdog_count" -lt "$active_count" ] || \
+       printf '%s\n' "$rows" | awk -F '\t' '$4 ~ /^(degraded|would-pause|recovering|unknown|exited)$/ { found = 1 } END { exit !found }'; then
+      health="warn"
+      health_label="WARN"
+    fi
+  fi
+  profile_display="$(visibility_display_path "$VISIBILITY_PROFILE")"
+  log_display="$(visibility_display_path "$LOG_FILE")"
+  log_bytes="$(visibility_log_bytes)"
+  last_incident="$(visibility_last_event 'would pause Claude|exit ip unavailable|exit ip not allowed|api path unhealthy|wake gap detected')"
+  last_recovery="$(visibility_last_event 'would resume Claude|route healthy')"
+
+  if [ "$STATUS_JSON" -eq 1 ]; then
+    sessions_json="$(visibility_sessions_json "$rows")"
+    jq -n \
+      --arg version "$VERSION" \
+      --arg mode "$mode" \
+      --arg health "$health" \
+      --arg config_state "$VISIBILITY_CONFIG_STATE" \
+      --arg proxy "$CLAUDE_PROXY_URL" \
+      --arg profile "$profile_display" \
+      --arg log_file "$log_display" \
+      --arg last_incident "$last_incident" \
+      --arg last_recovery "$last_recovery" \
+      --argjson notifications "$([ "$NOTIFY_ENABLED" = "1" ] && printf true || printf false)" \
+      --argjson active_sessions "$active_count" \
+      --argjson active_watchdogs "$watchdog_count" \
+      --argjson log_bytes "$log_bytes" \
+      --argjson sessions "$sessions_json" \
+      '{
+        version: $version,
+        health: $health,
+        mode: $mode,
+        notifications: $notifications,
+        config_state: $config_state,
+        proxy: $proxy,
+        profile: $profile,
+        active_sessions: $active_sessions,
+        active_watchdogs: $active_watchdogs,
+        log_file: $log_file,
+        log_bytes: $log_bytes,
+        last_incident: (if $last_incident == "" then null else $last_incident end),
+        last_recovery: (if $last_recovery == "" then null else $last_recovery end),
+        sessions: $sessions
+      }'
+    return 0
+  fi
+
+  printf 'Claude Guard Status\n'
+  printf '  version: %s\n' "$VERSION"
+  printf '  health: %s\n' "$health_label"
+  printf '  mode: %s\n' "$mode_label"
+  printf '  notifications: %s\n' "$notify_label"
+  printf '  config: %s\n' "$VISIBILITY_CONFIG_STATE"
+  printf '  profile: %s\n' "$profile_display"
+  printf '  proxy: %s\n' "$CLAUDE_PROXY_URL"
+  printf '  active Claude sessions: %s\n' "$active_count"
+  printf '  active watchdogs: %s\n' "$watchdog_count"
+  printf '  log: %s (%s bytes including archive)\n' "$log_display" "$log_bytes"
+  printf 'Sessions:\n'
+  if [ -z "$rows" ]; then
+    printf '  none\n'
+  else
+    while IFS=$'\t' read -r target_pid pgid watchdog state timestamp; do
+      [ -n "$target_pid" ] || continue
+      if [ "$watchdog" = "1" ]; then
+        watchdog="yes"
+      else
+        watchdog="no"
+      fi
+      printf '  pid=%s pgid=%s watchdog=%s state=%s last=%s\n' \
+        "$target_pid" "$pgid" "$watchdog" "$state" "$timestamp"
+    done <<EOF
+$rows
+EOF
+  fi
+  printf 'History:\n'
+  printf '  last incident: %s\n' "${last_incident:-none}"
+  printf '  last recovery: %s\n' "${last_recovery:-none}"
+}
+
+visibility_redact_stream() {
+  awk -v home="$HOME" '
+    function replace_literal(value, needle, replacement, result, position) {
+      if (needle == "") return value
+      result = ""
+      while ((position = index(value, needle)) > 0) {
+        result = result substr(value, 1, position - 1) replacement
+        value = substr(value, position + length(needle))
+      }
+      return result value
+    }
+    {
+      line = replace_literal($0, home, "~")
+      gsub(/[0-9][0-9]?[0-9]?\.[0-9][0-9]?[0-9]?\.[0-9][0-9]?[0-9]?\.[0-9][0-9]?[0-9]?/, "x.x.x.x", line)
+      gsub(/[Tt][Oo][Kk][Ee][Nn]=[^ ]+/, "token=[REDACTED]", line)
+      gsub(/[Ss][Ee][Cc][Rr][Ee][Tt]=[^ ]+/, "secret=[REDACTED]", line)
+      gsub(/[Aa][Uu][Tt][Hh]=[^ ]+/, "auth=[REDACTED]", line)
+      gsub(/[Kk][Ee][Yy]=[^ ]+/, "key=[REDACTED]", line)
+      gsub(/path=\/[^ ]+/, "path=[REDACTED]", line)
+      gsub(/profile=\/[^ ]+/, "profile=[REDACTED]", line)
+      gsub(/command=\/[^ ]+/, "command=[REDACTED]", line)
+      print line
+    }
+  '
+}
+
+print_diagnostic_report() {
+  local rows active_count watchdog_count allowed_count mode_label
+
+  load_visibility_config
+  rows="$(visibility_session_rows)"
+  active_count="$(printf '%s\n' "$rows" | awk 'NF { count += 1 } END { print count + 0 }')"
+  watchdog_count="$(printf '%s\n' "$rows" | awk -F '\t' 'NF { count += $3 } END { print count + 0 }')"
+  allowed_count=0
+  if [ "$VISIBILITY_CONFIG_STATE" = "valid" ]; then
+    allowed_count="$(jq -r '[(.allowed_ips // [])[], (.allowed_cidrs // [])[]] | length' "$CONFIG_FILE")"
+  fi
+  mode_label="action-refused"
+  [ "$WATCHDOG_DRY_RUN" = "1" ] && mode_label="dry-run"
+
+  {
+    printf 'Claude Guard Diagnostic (redacted)\n'
+    printf 'generated_at=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    printf 'version=%s\n' "$VERSION"
+    printf 'platform=%s\n' "$(uname -srm 2>/dev/null || printf unknown)"
+    printf 'mode=%s\n' "$mode_label"
+    printf 'notifications=%s\n' "$NOTIFY_ENABLED"
+    printf 'config_state=%s\n' "$VISIBILITY_CONFIG_STATE"
+    printf 'profile=%s\n' "$VISIBILITY_PROFILE"
+    printf 'proxy=%s\n' "$CLAUDE_PROXY_URL"
+    printf 'allowed_entries=%s\n' "$allowed_count"
+    printf 'active_sessions=%s\n' "$active_count"
+    printf 'active_watchdogs=%s\n' "$watchdog_count"
+    printf 'log_file=%s\n' "${LOG_FILE##*/}"
+    printf 'log_bytes=%s\n' "$(visibility_log_bytes)"
+    printf 'event_counts:\n'
+    visibility_log_stream | awk '
+      /watchdog started/ { started += 1 }
+      /exit ip unavailable|exit ip unknown/ { unavailable += 1 }
+      /exit ip not allowed/ { not_allowed += 1 }
+      /api path unhealthy/ { api += 1 }
+      /would pause Claude/ { paused += 1 }
+      /would resume Claude/ { resumed += 1 }
+      /watchdog exited|watchdog exiting because Claude/ { exited += 1 }
+      END {
+        printf "  watchdog_started=%d\n", started
+        printf "  ip_unavailable=%d\n", unavailable
+        printf "  ip_not_allowed=%d\n", not_allowed
+        printf "  api_unhealthy=%d\n", api
+        printf "  would_pause=%d\n", paused
+        printf "  would_resume=%d\n", resumed
+        printf "  watchdog_exited=%d\n", exited
+      }
+    '
+    printf 'recent_events:\n'
+    visibility_log_stream | awk '
+      /watchdog|DRY RUN|api path unhealthy|exit ip|wake gap|route healthy|resume candidate/ { print }
+    ' | tail -n 20
+  } | visibility_redact_stream
+}
+
 current_timezone() {
   node -e 'console.log(Intl.DateTimeFormat().resolvedOptions().timeZone || "")' 2>/dev/null || true
 }
@@ -1097,7 +1507,7 @@ pause_target() {
     if [ "$DRY_RUN_STDERR" = "1" ]; then
       printf '\nClaude Guardian dry-run: would pause Claude because %s\n' "$reason" >&2
     fi
-    notify_guard "Dry-run: would pause Claude because ${reason}"
+    notify_guard "Dry-run: would pause Claude pid ${target_pid} because ${reason}"
     return 0
   fi
 
@@ -1115,7 +1525,7 @@ resume_target() {
     if [ "$DRY_RUN_STDERR" = "1" ]; then
       printf '\nClaude Guardian dry-run: would resume Claude because %s\n' "$reason" >&2
     fi
-    notify_guard "Dry-run: would resume Claude because ${reason}"
+    notify_guard "Dry-run: would resume Claude pid ${target_pid} because ${reason}"
     return 0
   fi
 
@@ -1322,6 +1732,17 @@ start_watchdog_sidecar() {
   run_watchdog "$$" &
 }
 
+case "$COMMAND_MODE" in
+  status)
+    print_status_report
+    exit 0
+    ;;
+  diagnose)
+    print_diagnostic_report
+    exit 0
+    ;;
+esac
+
 if [ ! -f "$CONFIG_FILE" ]; then
   printf 'IP 安全配置不存在: %s\n' "$CONFIG_FILE" >&2
   printf '请创建配置，例如 {"command":"/path/to/claude","allowed_ips":["x.x.x.x"],"allowed_cidrs":["x.x.x.0/24"]}\n' >&2
@@ -1329,6 +1750,7 @@ if [ ! -f "$CONFIG_FILE" ]; then
 fi
 
 validate_json_file "$CONFIG_FILE" "IP 安全配置"
+resolve_notification_setting 1
 CLAUDE_BIN="$(jq -r '.command // empty' "$CONFIG_FILE")"
 OFFICIAL_CONFIG_DIR="$(jq -r '.config_dir // empty' "$CONFIG_FILE")"
 [ -n "$OFFICIAL_CONFIG_DIR" ] || OFFICIAL_CONFIG_DIR="$HOME/.claude-official"
@@ -1431,7 +1853,10 @@ if is_allowed_ip "$CURRENT_IP"; then
   ui_step_finish
   ui_finish
   if [ "$PRECHECK_ONLY" = "1" ]; then
-    if [ "$UI_ENABLED" -eq 1 ]; then
+    if [ "$COMMAND_MODE" = "doctor" ]; then
+      printf 'Doctor result: PASS (Claude was not started)\n'
+      print_status_report
+    elif [ "$UI_ENABLED" -eq 1 ]; then
       printf '  %sprecheck-only：未启动 Claude。%s\n' "$UI_DIM" "$UI_RESET" >&2
     else
       printf '预检完成：未启动 Claude。\n'

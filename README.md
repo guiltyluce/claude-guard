@@ -7,7 +7,7 @@ Claude 守护是一套 Claude Code 双通道版本与启动策略。它让官方
 通道保持严格、可审计和固定版本，同时允许本机 CC Switch 通道独立跟进较新的
 Claude Code 工程能力。两条通道共享客户端形态，但不共享 profile 和路由。
 
-当前版本：`2.0.3`
+当前版本：`2.0.4`
 
 > 本项目不是 Anthropic 或 Claude Code 官方项目。
 
@@ -114,6 +114,28 @@ Claude 守护只做本地启动前检查和 dry-run 观察。它不做：
 请只在符合服务条款和本地法规的场景中使用。守门程序只能降低本机配置和进程生命周期风险，不能保证账号不会被限制，也不能把换号绕过封禁变成合规行为。
 
 ## 版本历史
+
+### 2.0.4 - 可见性维护
+
+`2.0.4` 在 `2.0.3` 的低噪声日志基础上增加本地状态、主动诊断和脱敏报告。
+本版本不改变门禁、路由、OAuth、profile、session、探测阈值或 dry-run 边界。
+
+主要更新：
+
+- `claude-guard status` 离线读取进程表与 Guard 日志，显示 `OK/WARN/IDLE`、活动
+  Claude 会话、watchdog 覆盖、每个 PID 的最近状态和历史异常/恢复。
+- `claude-guard status --json` 提供相同快照的机器可读格式，方便后续本地工具集成。
+- `claude-guard doctor` 复用原有 8 步官方链路预检，成功后追加运行时快照；不会
+  启动 Claude，也不会调用模型。
+- `claude-guard diagnose` 完全离线生成可分享的脱敏摘要，隐藏真实 IPv4、HOME、
+  绝对路径和常见 token/key/auth/secret 赋值。
+- 安全配置新增可选布尔字段 `notify`；也可用 `CLAUDE_GUARD_NOTIFY=0|1` 覆盖。
+- pause/resume 通知继续只跟随状态转换触发，不按 watchdog tick 重复发送。
+- 新增 fake Claude、fake curl 和临时进程树 fixture，验证离线命令不访问网络、
+  doctor 不启动客户端、脱敏输出不泄漏敏感值、通知不重复。
+
+详细命令、输出语义和脱敏边界见
+[`docs/v2.0.4-visibility.md`](docs/v2.0.4-visibility.md)。
 
 ### 2.0.3 - Watchdog 观测加固
 
@@ -343,7 +365,8 @@ watchdog 或 Claude Code 启动参数。
 - guardian 默认只观察和记录，不会暂停、恢复或 kill Claude Code。
 - 运行中告警默认只写日志，不向 Claude Code TUI 输出内容。
 - 如需终端提示，可设置 `CLAUDE_GUARD_DRY_RUN_STDERR=1`。
-- 如需 macOS 通知，可设置 `CLAUDE_GUARD_NOTIFY=1`。
+- 如需 macOS 通知，可在安全配置中设置 `"notify": true`，或临时设置
+  `CLAUDE_GUARD_NOTIFY=1`。
 
 边界说明：
 
@@ -446,7 +469,8 @@ cp config/safe-claude.example.json ~/.safe-claude-official.json
   "client_macos_team_id": "Q6L2SF6YDW",
   "blocked_plugins": ["codex@openai-codex"],
   "blocked_models": [],
-  "require_unpinned_model": false
+  "require_unpinned_model": false,
+  "notify": false
 }
 ```
 
@@ -460,6 +484,10 @@ cp config/safe-claude.example.json ~/.safe-claude-official.json
 `require_unpinned_model` 默认建议为 `false`，让客户端升级只更换内核，不同时
 改动已经稳定使用的模型设置。需要专门测试新版默认模型选择时才设为 `true`；
 如需单次指定模型，使用 `claude --model <name>`。
+
+`notify` 默认 `false`。设为 `true` 后，macOS 会在 dry-run watchdog 记录
+would-pause / would-resume 状态转换时发送通知；它不会改变进程状态，也不会向
+Claude Code TUI 写入内容。环境变量 `CLAUDE_GUARD_NOTIFY=0|1` 的优先级更高。
 
 官方 profile 还必须合并 [`config/official-settings-lifecycle.example.json`](config/official-settings-lifecycle.example.json) 中的生命周期字段。不要直接覆盖自己的权限等其他设置。
 
@@ -485,6 +513,28 @@ cp config/safe-claude-cc.example.json ~/.safe-claude-cc.json
 `.credentials.json`，并检查本机 endpoint 可达。
 
 ## 使用
+
+离线查看当前会话、watchdog 覆盖和最近历史：
+
+```bash
+claude-guard status
+claude-guard status --json
+```
+
+运行完整官方链路检查并追加状态快照，不启动 Claude：
+
+```bash
+claude-guard doctor
+```
+
+生成适合分享的离线脱敏诊断摘要：
+
+```bash
+claude-guard diagnose
+```
+
+`status` 和 `diagnose` 不访问网络。`doctor` 会执行与正常启动相同的 IP、TLS、
+IPv6 和配置检查，但不会启动 Claude Code，也不会提交 prompt。
 
 官方通道只做预检，不启动 Claude：
 
@@ -623,6 +673,7 @@ CLAUDE_GUARD_FINGERPRINT_MODE=fail-active
 - dry-run guardian 状态机。
 - paused 状态探测退避、IP 状态分类、PID 日志归因和恢复路径集成测试。
 - 并发安全的日志轮转。
+- 离线 `status`、JSON 状态、`doctor`、脱敏 `diagnose` 和通知去重。
 - 模拟前台 Claude 退出后 watchdog sidecar 在限定时间内退出。
 - CC Switch 客户端版本、SHA-256 与签章固定。
 - CC Switch loopback endpoint 和 `PROXY_MANAGED` profile 固定。

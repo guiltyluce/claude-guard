@@ -11,5 +11,6 @@
     "codex@openai-codex"
   ],
   "blocked_models": [],
-  "require_unpinned_model": false
+  "require_unpinned_model": false,
+  "notify": false
 }

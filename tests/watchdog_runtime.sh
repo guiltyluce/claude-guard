@@ -84,6 +84,15 @@ exit 1
 EOF
 chmod +x "$TMP_DIR/bin/curl"
 
+cat >"$TMP_DIR/bin/osascript" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+mkdir -p "$HOME/watchdog-fixture"
+printf '%s\n' "$*" >>"$HOME/watchdog-fixture/notifications.log"
+EOF
+chmod +x "$TMP_DIR/bin/osascript"
+
 cat >"$TMP_DIR/bin/fake-claude" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -125,7 +134,7 @@ cat >"$TMP_DIR/settings.json" <<'EOF'
 EOF
 
 printf 'fake ca\n' >"$TMP_DIR/cert.pem"
-printf '{"command":"%s","allowed_ips":["203.0.113.10"]}\n' \
+printf '{"command":"%s","allowed_ips":["203.0.113.10"],"notify":true}\n' \
   "$TMP_DIR/bin/fake-claude" >"$TMP_DIR/config.json"
 
 run_case() {
@@ -201,6 +210,13 @@ grep -q 'exit ip unavailable count=1/2' "$TMP_DIR/recover.log"
 grep -q 'exit ip not allowed ip=198.51.100.55 count=2/2' "$TMP_DIR/recover.log"
 grep -q 'DRY RUN: would pause Claude' "$TMP_DIR/recover.log"
 grep -q 'DRY RUN: would resume Claude' "$TMP_DIR/recover.log"
+notification_count="$(wc -l <"$TMP_DIR/home/watchdog-fixture/notifications.log" | tr -d '[:space:]')"
+if [ "$notification_count" -ne 2 ]; then
+  printf 'expected exactly two pause/resume notifications, got %s\n' "$notification_count" >&2
+  exit 1
+fi
+grep -q 'would pause Claude' "$TMP_DIR/home/watchdog-fixture/notifications.log"
+grep -q 'would resume Claude' "$TMP_DIR/home/watchdog-fixture/notifications.log"
 
 if awk '!/pid=[0-9]+/ {print; bad=1} END {exit bad}' "$TMP_DIR/recover.log"; then
   :

@@ -2,6 +2,20 @@
 
 更完整的版本目标、设计边界和验证说明见 README 的“版本历史”部分。
 
+## 2.0.4 - 2026-08-01
+
+- 新增离线 `status`，显示总体健康、活动 Claude 会话、watchdog 覆盖、PID 状态、
+  日志大小和最近异常/恢复。
+- 新增 `status --json` 机器可读输出。
+- 新增 `doctor`，复用完整启动前门禁并在成功后追加状态快照，不启动 Claude。
+- 新增离线 `diagnose`，输出脱敏环境与日志摘要；遮蔽 IPv4、HOME、绝对路径和
+  常见 token/key/auth/secret 赋值。
+- 安全配置支持可选布尔字段 `notify`，环境变量 `CLAUDE_GUARD_NOTIFY=0|1` 可覆盖。
+- 新增可见性 fixture，覆盖零网络 status/diagnose、doctor 无模型启动、活动进程树、
+  JSON 契约、脱敏和单次 pause/resume 通知。
+- 保持 watchdog dry-run，不新增信号，不改变 endpoint、OAuth、profile、session、
+  网络探测频率、失败阈值或 CC Switch 行为。
+
 ## 2.0.3 - 2026-08-01
 
 - paused / resume-pending 状态改为默认每 30 秒成对探测出口 IP 与 Anthropic API，

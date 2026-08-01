@@ -1,5 +1,15 @@
 # Roadmap
 
+## v2.0.4
+
+将 `v2.0.3` 的结构化日志变成可直接读取的本地观察面。
+
+- 离线 `status` 与 JSON 状态快照。
+- 主动 `doctor`，复用启动门禁但不启动 Claude。
+- 离线脱敏 `diagnose` 报告。
+- 配置化 macOS 状态转换通知。
+- 保持 dry-run，不发送进程控制信号。
+
 ## v2.0.3
 
 基于真实长期日志加固 dry-run watchdog 的可观测性。

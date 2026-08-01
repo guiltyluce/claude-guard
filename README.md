@@ -7,7 +7,7 @@ Claude 守护是一套 Claude Code 双通道版本与启动策略。它让官方
 通道保持严格、可审计和固定版本，同时允许本机 CC Switch 通道独立跟进较新的
 Claude Code 工程能力。两条通道共享客户端形态，但不共享 profile 和路由。
 
-当前版本：`2.0.2`
+当前版本：`2.0.3`
 
 > 本项目不是 Anthropic 或 Claude Code 官方项目。
 
@@ -91,9 +91,12 @@ fail-closed 策略和运行中 dry-run guardian。启动 Claude Code 前会检�
 
 - 每 60 秒低频检查出口 IP。
 - 每 180 秒低频检查 `api.anthropic.com` 官方路径。
+- 进入逻辑 paused 状态后，每 30 秒成对检查一次 IP 与 API，不再跟随 5 秒 tick
+  重复探测。
 - 检测长时间 sleep/wake gap。
 - 记录“本来会 pause/resume”的动作，默认只写日志，不污染 Claude Code TUI。
-- 写入本地日志 `~/.claude-guard/guard.log`。
+- 每条运行中日志带目标 Claude PID，区分 IP 查询不可用和实际非白名单出口。
+- 写入本地日志 `~/.claude-guard/guard.log`；超过 1MB 自动轮转为 `guard.log.1`。
 
 它不会调用模型，不会使用账号 token，也不会消耗 Claude 额度。
 
@@ -111,6 +114,27 @@ Claude 守护只做本地启动前检查和 dry-run 观察。它不做：
 请只在符合服务条款和本地法规的场景中使用。守门程序只能降低本机配置和进程生命周期风险，不能保证账号不会被限制，也不能把换号绕过封禁变成合规行为。
 
 ## 版本历史
+
+### 2.0.3 - Watchdog 观测加固
+
+`2.0.3` 根据真实长期日志收敛 dry-run watchdog 的探测与记录方式。本版本仍不发送
+pause、resume 或 kill 信号，不改变启动前门禁、官方路由、OAuth、客户端或 session。
+
+主要更新：
+
+- paused / resume-pending 状态改为每 30 秒执行一次成对 IP+API 恢复探测，取消
+  原先每个 5 秒 tick 重复 API 探测的放大行为。
+- 恢复计数只在完成一轮新的 IP+API 探测后递增，避免复用旧结果过早判定恢复。
+- 所有 runtime 日志加入目标 Claude PID，多终端会话可以分别归因。
+- 将 `exit ip unavailable` 与 `exit ip not allowed` 分开，避免把查询源失败描述成
+  真实出口漂移。
+- 失败计数在阈值处封顶；恢复失败只记录首次与每第 10 次，降低日志噪声。
+- HUP、INT、TERM 和目标进程消失都会写入明确退出原因。
+- 日志默认超过 1MB 后轮转为 `guard.log.1`，使用目录锁避免多个 watchdog 同时轮转。
+- 新增实际 launcher + fake Claude + fake curl 的 runtime 集成测试，全程不访问网络。
+
+详细设计和兼容边界见
+[`docs/v2.0.3-watchdog-observability.md`](docs/v2.0.3-watchdog-observability.md)。
 
 ### 2.0.2 - 启动前门禁视觉升级
 
@@ -514,11 +538,13 @@ CLAUDE_GUARD_IP_CHECK_URLS="https://ipinfo.io/ip https://api.ipify.org"
 CLAUDE_GUARD_ASSUME_YES=1
 CLAUDE_GUARD_WATCHDOG=1
 CLAUDE_GUARD_WATCHDOG_DRY_RUN=1
+CLAUDE_GUARD_RECOVERY_INTERVAL=30
 CLAUDE_GUARD_DRY_RUN_STDERR=0
 CLAUDE_GUARD_NOTIFY=0
 CLAUDE_GUARD_FINGERPRINT_MODE=fail-active
 CLAUDE_GUARD_LEGACY_PROFILE_MODE=warn
 CLAUDE_GUARD_LOG_FILE=~/.claude-guard/guard.log
+CLAUDE_GUARD_LOG_MAX_BYTES=1048576
 ```
 
 ## 生命周期 Fail-Closed
@@ -595,6 +621,8 @@ CLAUDE_GUARD_FINGERPRINT_MODE=fail-active
 - IP 检查备用源 fallback。
 - `allowed_cidrs` 放行路径。
 - dry-run guardian 状态机。
+- paused 状态探测退避、IP 状态分类、PID 日志归因和恢复路径集成测试。
+- 并发安全的日志轮转。
 - 模拟前台 Claude 退出后 watchdog sidecar 在限定时间内退出。
 - CC Switch 客户端版本、SHA-256 与签章固定。
 - CC Switch loopback endpoint 和 `PROXY_MANAGED` profile 固定。

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="2.0.2"
+VERSION="2.0.3"
 
 CONFIG_FILE="${CLAUDE_GUARD_CONFIG:-${SAFE_CLAUDE_CONFIG:-$HOME/.safe-claude-official.json}}"
 OFFICIAL_SETTINGS_OVERRIDE="${CLAUDE_GUARD_SETTINGS:-}"
@@ -19,6 +19,7 @@ WATCHDOG_ENABLED="${CLAUDE_GUARD_WATCHDOG:-1}"
 WATCHDOG_DRY_RUN="${CLAUDE_GUARD_WATCHDOG_DRY_RUN:-1}"
 IP_INTERVAL="${CLAUDE_GUARD_IP_INTERVAL:-60}"
 API_INTERVAL="${CLAUDE_GUARD_API_INTERVAL:-180}"
+RECOVERY_INTERVAL="${CLAUDE_GUARD_RECOVERY_INTERVAL:-30}"
 WATCHDOG_TICK_SECONDS="${CLAUDE_GUARD_WATCHDOG_TICK_SECONDS:-5}"
 WAKE_GAP_SECONDS="${CLAUDE_GUARD_WAKE_GAP_SECONDS:-120}"
 IP_BAD_THRESHOLD="${CLAUDE_GUARD_IP_BAD_THRESHOLD:-2}"
@@ -26,6 +27,7 @@ API_BAD_THRESHOLD="${CLAUDE_GUARD_API_BAD_THRESHOLD:-3}"
 RESUME_GOOD_THRESHOLD="${CLAUDE_GUARD_RESUME_GOOD_THRESHOLD:-2}"
 KILL_AFTER_PAUSE_SECONDS="${CLAUDE_GUARD_KILL_AFTER_PAUSE_SECONDS:-}"
 LOG_FILE="${CLAUDE_GUARD_LOG_FILE:-$HOME/.claude-guard/guard.log}"
+LOG_MAX_BYTES="${CLAUDE_GUARD_LOG_MAX_BYTES:-1048576}"
 NOTIFY_ENABLED="${CLAUDE_GUARD_NOTIFY:-0}"
 DRY_RUN_STDERR="${CLAUDE_GUARD_DRY_RUN_STDERR:-0}"
 FINGERPRINT_MODE="${CLAUDE_GUARD_FINGERPRINT_MODE:-fail-active}"
@@ -75,6 +77,8 @@ Environment:
   CLAUDE_GUARD_WATCHDOG      Set to 0 to disable runtime guarding. Default: 1
   CLAUDE_GUARD_WATCHDOG_DRY_RUN
                               Default: 1. Logs would-pause/would-resume actions only.
+  CLAUDE_GUARD_RECOVERY_INTERVAL
+                              Seconds between paired IP/API probes while degraded. Default: 30.
   CLAUDE_GUARD_DRY_RUN_STDERR
                               Set to 1 to print dry-run pause/resume notices to stderr.
   CLAUDE_GUARD_FINGERPRINT_MODE
@@ -82,6 +86,7 @@ Environment:
   CLAUDE_GUARD_LEGACY_PROFILE_MODE
                               off, warn, or strict for ~/.claude contamination. Default: warn.
   CLAUDE_GUARD_LOG_FILE      Default: ~/.claude-guard/guard.log
+  CLAUDE_GUARD_LOG_MAX_BYTES Rotate to guard.log.1 after this size. Default: 1048576.
 
 Lifecycle policy:
   Background agents, background tasks, cron, workflows, Remote Control,
@@ -773,6 +778,34 @@ check_anthropic_ipv6_blocked() {
   ui_note 'IPv6 预检通过：api.anthropic.com IPv6 不可达，Claude 官方链路将压在 IPv4。'
 }
 
+rotate_guard_log_if_needed() {
+  local size lock archive
+
+  case "$LOG_MAX_BYTES" in
+    ''|*[!0-9]*) return 0 ;;
+  esac
+  [ "$LOG_MAX_BYTES" -gt 0 ] || return 0
+  [ -f "$LOG_FILE" ] || return 0
+
+  size="$(wc -c <"$LOG_FILE" 2>/dev/null | tr -d '[:space:]')" || return 0
+  [ "${size:-0}" -gt "$LOG_MAX_BYTES" ] || return 0
+
+  lock="${LOG_FILE}.rotate.lock"
+  if ! mkdir "$lock" 2>/dev/null; then
+    return 0
+  fi
+
+  size="$(wc -c <"$LOG_FILE" 2>/dev/null | tr -d '[:space:]')" || {
+    rmdir "$lock" 2>/dev/null || true
+    return 0
+  }
+  if [ "${size:-0}" -gt "$LOG_MAX_BYTES" ]; then
+    archive="${LOG_FILE}.1"
+    mv -f "$LOG_FILE" "$archive" 2>/dev/null || true
+  fi
+  rmdir "$lock" 2>/dev/null || true
+}
+
 log_guard() {
   local level="$1"
   local message="$2"
@@ -781,6 +814,7 @@ log_guard() {
   timestamp="$(date '+%Y-%m-%dT%H:%M:%S%z')"
   dir="$(dirname "$LOG_FILE")"
   mkdir -p "$dir"
+  rotate_guard_log_if_needed
   printf '%s [%s] %s\n' "$timestamp" "$level" "$message" >>"$LOG_FILE"
 }
 
@@ -1037,6 +1071,23 @@ check_api_path_once() {
   return 0
 }
 
+watchdog_log() {
+  local target_pid="$1"
+  local level="$2"
+  local message="$3"
+
+  log_guard "$level" "watchdog pid=${target_pid} ${message}"
+}
+
+watchdog_signal_exit() {
+  local target_pid="$1"
+  local signal="$2"
+
+  trap - HUP INT TERM
+  watchdog_log "$target_pid" "INFO" "watchdog exited reason=signal-${signal}"
+  exit 0
+}
+
 pause_target() {
   local target_pid="$1"
   local reason="$2"
@@ -1077,108 +1128,184 @@ run_watchdog() {
   local target_pid="$1"
   local state="healthy"
   local current_ip=""
+  local ip_status="unavailable"
   local ip_ok=0
   local api_ok=1
   local ip_bad_count=0
   local api_bad_count=0
   local resume_good_count=0
+  local recovery_failure_count=0
   local paused_since=0
-  local last_tick now next_ip_check next_api_check reason
+  local kill_notice_logged=0
+  local last_tick now next_ip_check next_api_check next_recovery_check reason previous_count
 
   last_tick="$(date +%s)"
   next_ip_check="$last_tick"
   next_api_check="$last_tick"
+  next_recovery_check="$last_tick"
   log_guard "INFO" "watchdog started pid=${target_pid} proxy=${CLAUDE_PROXY_URL} dry_run=${WATCHDOG_DRY_RUN}"
+  trap 'watchdog_signal_exit "$target_pid" HUP' HUP
+  trap 'watchdog_signal_exit "$target_pid" INT' INT
+  trap 'watchdog_signal_exit "$target_pid" TERM' TERM
 
   while kill -0 "$target_pid" 2>/dev/null; do
     now="$(date +%s)"
 
     if [ $((now - last_tick)) -gt "$WAKE_GAP_SECONDS" ]; then
-      log_guard "WARN" "wake gap detected gap_seconds=$((now - last_tick)) state=${state}"
-      if [ "$state" = "paused" ]; then
-        state="resume-pending"
+      watchdog_log "$target_pid" "WARN" "wake gap detected gap_seconds=$((now - last_tick)) state=${state}"
+      resume_good_count=0
+      if [ "$state" = "paused" ] || [ "$state" = "resume-pending" ]; then
+        state="paused"
+        next_recovery_check="$now"
       else
         state="degraded"
+        next_ip_check="$now"
+        next_api_check="$now"
       fi
-      next_ip_check="$now"
-      next_api_check="$now"
     fi
     last_tick="$now"
 
+    if [ "$state" = "paused" ] || [ "$state" = "resume-pending" ]; then
+      if [ "$now" -ge "$next_recovery_check" ]; then
+        current_ip="$(get_current_ip_once || true)"
+        if [ -z "$current_ip" ]; then
+          ip_status="unavailable"
+          ip_ok=0
+        elif is_allowed_ip "$current_ip"; then
+          ip_status="allowed"
+          ip_ok=1
+        else
+          ip_status="not-allowed"
+          ip_ok=0
+        fi
+
+        if check_api_path_once; then
+          api_ok=1
+        else
+          api_ok=0
+        fi
+
+        if [ "$ip_ok" -eq 1 ] && [ "$api_ok" -eq 1 ]; then
+          state="resume-pending"
+          recovery_failure_count=0
+          resume_good_count=$((resume_good_count + 1))
+          watchdog_log "$target_pid" "INFO" "resume candidate count=${resume_good_count}/${RESUME_GOOD_THRESHOLD} ip=${current_ip}"
+          if [ "$resume_good_count" -ge "$RESUME_GOOD_THRESHOLD" ]; then
+            reason="route healthy again ip=${current_ip}"
+            resume_target "$target_pid" "$reason" || true
+            state="healthy"
+            ip_bad_count=0
+            api_bad_count=0
+            resume_good_count=0
+            paused_since=0
+            kill_notice_logged=0
+            next_ip_check=$((now + IP_INTERVAL))
+            next_api_check=$((now + API_INTERVAL))
+          fi
+        else
+          state="paused"
+          resume_good_count=0
+          recovery_failure_count=$((recovery_failure_count + 1))
+          if [ "$recovery_failure_count" -eq 1 ] || [ $((recovery_failure_count % 10)) -eq 0 ]; then
+            watchdog_log "$target_pid" "WARN" \
+              "recovery check unhealthy attempt=${recovery_failure_count} ip_status=${ip_status} api_ok=${api_ok}"
+          fi
+        fi
+        next_recovery_check=$(($(date +%s) + RECOVERY_INTERVAL))
+      fi
+
+      if [ -n "$KILL_AFTER_PAUSE_SECONDS" ] && [ "$paused_since" -gt 0 ] && \
+         [ $((now - paused_since)) -ge "$KILL_AFTER_PAUSE_SECONDS" ] && \
+         [ "$kill_notice_logged" -eq 0 ]; then
+        watchdog_log "$target_pid" "ERROR" \
+          "kill-after-pause reached but automatic kill is not implemented in v${VERSION}"
+        kill_notice_logged=1
+      fi
+
+      sleep "$WATCHDOG_TICK_SECONDS"
+      continue
+    fi
+
     if [ "$now" -ge "$next_ip_check" ]; then
       current_ip="$(get_current_ip_once || true)"
-      if [ -n "$current_ip" ] && is_allowed_ip "$current_ip"; then
+      if [ -z "$current_ip" ]; then
+        ip_status="unavailable"
+        ip_ok=0
+        previous_count="$ip_bad_count"
+        if [ "$ip_bad_count" -lt "$IP_BAD_THRESHOLD" ]; then
+          ip_bad_count=$((ip_bad_count + 1))
+        fi
+        if [ "$ip_bad_count" -ne "$previous_count" ]; then
+          watchdog_log "$target_pid" "WARN" \
+            "exit ip unavailable count=${ip_bad_count}/${IP_BAD_THRESHOLD} state=${state}"
+        fi
+      elif is_allowed_ip "$current_ip"; then
+        ip_status="allowed"
         ip_ok=1
         ip_bad_count=0
       else
+        ip_status="not-allowed"
         ip_ok=0
-        ip_bad_count=$((ip_bad_count + 1))
-        if [ -n "$current_ip" ]; then
-          log_guard "WARN" "exit ip not allowed ip=${current_ip} count=${ip_bad_count}/${IP_BAD_THRESHOLD} state=${state}"
-        else
-          log_guard "WARN" "exit ip unknown count=${ip_bad_count}/${IP_BAD_THRESHOLD} state=${state}"
+        previous_count="$ip_bad_count"
+        if [ "$ip_bad_count" -lt "$IP_BAD_THRESHOLD" ]; then
+          ip_bad_count=$((ip_bad_count + 1))
+        fi
+        if [ "$ip_bad_count" -ne "$previous_count" ]; then
+          watchdog_log "$target_pid" "WARN" \
+            "exit ip not allowed ip=${current_ip} count=${ip_bad_count}/${IP_BAD_THRESHOLD} state=${state}"
         fi
       fi
       next_ip_check=$((now + IP_INTERVAL))
     fi
 
-    if [ "$now" -ge "$next_api_check" ] || [ "$state" = "paused" ] || [ "$state" = "resume-pending" ]; then
+    if [ "$now" -ge "$next_api_check" ]; then
       if check_api_path_once; then
         api_ok=1
         api_bad_count=0
       else
         api_ok=0
-        api_bad_count=$((api_bad_count + 1))
-        log_guard "WARN" "api path unhealthy count=${api_bad_count}/${API_BAD_THRESHOLD} state=${state}"
+        previous_count="$api_bad_count"
+        if [ "$api_bad_count" -lt "$API_BAD_THRESHOLD" ]; then
+          api_bad_count=$((api_bad_count + 1))
+        fi
+        if [ "$api_bad_count" -ne "$previous_count" ]; then
+          watchdog_log "$target_pid" "WARN" \
+            "api path unhealthy count=${api_bad_count}/${API_BAD_THRESHOLD} state=${state}"
+        fi
       fi
       next_api_check=$((now + API_INTERVAL))
     fi
 
-    if [ "$state" = "paused" ] || [ "$state" = "resume-pending" ]; then
-      if [ "$ip_ok" -eq 1 ] && [ "$api_ok" -eq 1 ]; then
-        state="resume-pending"
-        resume_good_count=$((resume_good_count + 1))
-        log_guard "INFO" "resume candidate count=${resume_good_count}/${RESUME_GOOD_THRESHOLD} ip=${current_ip:-unknown}"
-        if [ "$resume_good_count" -ge "$RESUME_GOOD_THRESHOLD" ]; then
-          reason="route healthy again ip=${current_ip:-unknown}"
-          resume_target "$target_pid" "$reason" || true
-          state="healthy"
-          resume_good_count=0
-          paused_since=0
-        fi
-      else
-        state="paused"
-        resume_good_count=0
-      fi
-    elif [ "$ip_bad_count" -ge "$IP_BAD_THRESHOLD" ]; then
+    if [ "$ip_bad_count" -ge "$IP_BAD_THRESHOLD" ]; then
       state="paused"
       paused_since="$now"
-      reason="exit IP unsafe ip=${current_ip:-unknown}"
+      if [ "$ip_status" = "unavailable" ]; then
+        reason="exit IP check unavailable"
+      else
+        reason="exit IP not allowed ip=${current_ip}"
+      fi
       pause_target "$target_pid" "$reason" || true
+      next_recovery_check=$(($(date +%s) + RECOVERY_INTERVAL))
     elif [ "$api_bad_count" -ge "$API_BAD_THRESHOLD" ]; then
       state="paused"
       paused_since="$now"
       reason="api path unhealthy"
       pause_target "$target_pid" "$reason" || true
+      next_recovery_check=$(($(date +%s) + RECOVERY_INTERVAL))
     elif [ "$ip_ok" -eq 1 ] && [ "$api_ok" -eq 1 ]; then
       if [ "$state" != "healthy" ]; then
-        log_guard "INFO" "route healthy ip=${current_ip:-unknown}"
+        watchdog_log "$target_pid" "INFO" "route healthy ip=${current_ip:-unknown}"
       fi
       state="healthy"
     else
       state="degraded"
     fi
 
-    if [ -n "$KILL_AFTER_PAUSE_SECONDS" ] && [ "$state" = "paused" ] && [ "$paused_since" -gt 0 ]; then
-      if [ $((now - paused_since)) -ge "$KILL_AFTER_PAUSE_SECONDS" ]; then
-        log_guard "ERROR" "kill-after-pause reached but automatic kill is not implemented in v${VERSION}; pid=${target_pid}"
-      fi
-    fi
-
     sleep "$WATCHDOG_TICK_SECONDS"
   done
 
-  log_guard "INFO" "watchdog exiting because Claude pid=${target_pid} is gone"
+  trap - HUP INT TERM
+  watchdog_log "$target_pid" "INFO" "watchdog exited reason=target-gone"
 }
 
 start_watchdog_sidecar() {

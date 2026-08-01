@@ -1,5 +1,15 @@
 # Roadmap
 
+## v2.0.3
+
+基于真实长期日志加固 dry-run watchdog 的可观测性。
+
+- paused 状态使用 30 秒成对恢复探测，避免 5 秒 tick 放大。
+- runtime 日志加入 Claude PID，并区分 IP unavailable / not allowed。
+- 恢复失败按里程碑降噪，日志超过 1MB 自动轮转。
+- 记录 sidecar 的信号和 target-gone 退出原因。
+- 保持 dry-run，不发送进程控制信号。
+
 ## v2.0.2
 
 启动前门禁视觉升级。

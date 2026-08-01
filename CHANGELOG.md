@@ -2,6 +2,21 @@
 
 更完整的版本目标、设计边界和验证说明见 README 的“版本历史”部分。
 
+## 2.0.3 - 2026-08-01
+
+- paused / resume-pending 状态改为默认每 30 秒成对探测出口 IP 与 Anthropic API，
+  不再按 5 秒 watchdog tick 重复 API 探测。
+- 恢复计数只接受新完成的成对健康结果，避免复用旧状态连续递增。
+- runtime 日志统一加入目标 Claude PID。
+- 将 IP 查询源不可用与拿到非白名单 IP 分成不同事件和 pause reason。
+- 失败计数在阈值处封顶；持续恢复失败只记录首次和每第 10 次。
+- 新增 HUP、INT、TERM 与 target-gone 退出原因记录。
+- `guard.log` 默认超过 1MB 后并发安全地轮转为 `guard.log.1`。
+- 新增真实 launcher 的 watchdog runtime 集成测试，覆盖长故障、恢复、探测上限、
+  PID 归因、退出记录和日志轮转；fixture 不访问真实网络。
+- 保持 dry-run，不新增 pause/resume/kill 信号，不改变官方 endpoint、OAuth、profile、
+  session、启动前 fail-closed 或 Claude Code 参数。
+
 ## 2.0.2 - 2026-07-30
 
 - 官方通道新增 8 步可视化预检，以固定宽度进度条显示检查进度。

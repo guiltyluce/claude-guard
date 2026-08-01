@@ -255,11 +255,11 @@ kill -TERM "$main_pid"
 wait "$main_pid" 2>/dev/null || true
 
 for _ in 1 2 3 4 5; do
-  if grep -q "watchdog exiting because Claude pid=${main_pid} is gone" "$TMP_DIR/guard.log" 2>/dev/null; then
+  if grep -q "watchdog pid=${main_pid} watchdog exited reason=target-gone" "$TMP_DIR/guard.log" 2>/dev/null; then
     break
   fi
   sleep 1
 done
-grep -q "watchdog exiting because Claude pid=${main_pid} is gone" "$TMP_DIR/guard.log"
+grep -q "watchdog pid=${main_pid} watchdog exited reason=target-gone" "$TMP_DIR/guard.log"
 
 printf 'lifecycle policy ok\n'

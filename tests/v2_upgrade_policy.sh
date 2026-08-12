@@ -32,6 +32,12 @@ args="$*"
 if printf '%s' "$args" | grep -Eq '(^| )-6( |$)'; then
   exit 7
 fi
+if printf '%s' "$args" | grep -q '/cdn-cgi/trace'; then
+  printf 'h=api.anthropic.com\n'
+  printf 'ip=%s\n' "${FAKE_EXIT_IP:-203.0.113.10}"
+  printf 'visit_scheme=https\n'
+  exit 0
+fi
 if printf '%s' "$args" | grep -Eq 'https://(ipinfo.io/ip|api.ipify.org)'; then
   printf '%s\n' "${FAKE_EXIT_IP:-203.0.113.10}"
   exit 0

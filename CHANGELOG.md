@@ -2,6 +2,18 @@
 
 更完整的版本目标、设计边界和验证说明见 README 的“版本历史”部分。
 
+## Unreleased
+
+- 出口 IP 探测改为默认使用 `api.anthropic.com/cdn-cgi/trace`，回退到
+  `claude.ai/cdn-cgi/trace`，不再默认依赖 `ipinfo.io` / `api.ipify.org`。
+  按规则分流的代理（Clash、Mihomo、Surge 等）依目标域名选择出站策略，第三方查询域名
+  通常落到兜底策略，导致探测到的出口与 Claude 实际使用的出口无关，白名单校验因此
+  失去意义（既可能误拒，也可能漏过真实漂移）。
+- `get_current_ip_once` 同时接受裸 IP 响应体和 `/cdn-cgi/trace` 的 `key=value` 格式，
+  用户仍可通过 `CLAUDE_GUARD_IP_CHECK_URLS` 覆盖为任意查询源。
+- 新增 `tests/ip_probe_format.sh`，覆盖两种响应体格式、默认值以及 trace 解析结果
+  不在白名单时仍然 fail-closed。
+
 ## 2.0.4 - 2026-08-01
 
 - 新增离线 `status`，显示总体健康、活动 Claude 会话、watchdog 覆盖、PID 状态、

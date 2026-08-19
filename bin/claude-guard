@@ -11,7 +11,7 @@ CA_CERT_FILE="${CLAUDE_GUARD_CA_CERT:-/etc/ssl/cert.pem}"
 CLAUDE_PROXY_URL="${CLAUDE_GUARD_PROXY:-${CLAUDE_OFFICIAL_PROXY:-http://127.0.0.1:7897}}"
 NO_PROXY_LIST="${CLAUDE_GUARD_NO_PROXY:-${CLAUDE_OFFICIAL_NO_PROXY:-127.0.0.1,localhost,::1,.local}}"
 IP_CHECK_RETRIES="${CLAUDE_GUARD_IP_RETRIES:-${CLAUDE_OFFICIAL_IP_RETRIES:-3}}"
-IP_CHECK_URLS="${CLAUDE_GUARD_IP_CHECK_URLS:-${CLAUDE_OFFICIAL_IP_CHECK_URLS:-https://api.anthropic.com/cdn-cgi/trace https://claude.ai/cdn-cgi/trace}}"
+IP_CHECK_URLS="${CLAUDE_GUARD_IP_CHECK_URLS:-${CLAUDE_OFFICIAL_IP_CHECK_URLS:-https://api.anthropic.com/cdn-cgi/trace}}"
 TLS_CHECK_RETRIES="${CLAUDE_GUARD_TLS_RETRIES:-${CLAUDE_OFFICIAL_TLS_RETRIES:-3}}"
 PLATFORM_TLS_MODE="${CLAUDE_GUARD_PLATFORM_TLS_MODE:-${CLAUDE_OFFICIAL_PLATFORM_TLS_MODE:-warn}}"
 ASSUME_YES="${CLAUDE_GUARD_ASSUME_YES:-0}"
@@ -79,7 +79,9 @@ Environment:
   CLAUDE_GUARD_PROXY         Required proxy URL. Default: http://127.0.0.1:7897
   CLAUDE_GUARD_NO_PROXY      NO_PROXY list. Default: 127.0.0.1,localhost,::1,.local
   CLAUDE_GUARD_ASSUME_YES    Set to 1 to skip the final Enter prompt when IP is allowed.
-  CLAUDE_GUARD_IP_CHECK_URLS Space-separated IPv4 echo endpoints.
+  CLAUDE_GUARD_IP_CHECK_URLS Space-separated egress probe endpoints. Both bare-IP
+                             and /cdn-cgi/trace response bodies are accepted.
+                             Default: https://api.anthropic.com/cdn-cgi/trace
   CLAUDE_GUARD_UI             auto, always, or never. Default: auto.
                               auto renders the visual preflight only in an interactive terminal.
   NO_COLOR                   Disable ANSI colors while keeping the visual preflight layout.
@@ -1436,7 +1438,12 @@ get_current_ip_once() {
   local url ip raw
 
   for url in $IP_CHECK_URLS; do
-    raw="$(official_net_env curl -4 -x "$CLAUDE_PROXY_URL" -fsS --connect-timeout 5 --max-time 10 "$url" 2>/dev/null || true)"
+    # curl 非零退出时一律丢弃响应体。--max-time 超时（退出码 28）等情况下 curl 可能
+    # 已经吐出包含完整 ip= 字段的部分响应，采信它等于拿一个来路不明的截断结果去判定
+    # 白名单；此处宁可探测失败，交给外层重试与 exit 3 处理。
+    if ! raw="$(official_net_env curl -4 -x "$CLAUDE_PROXY_URL" -fsS --connect-timeout 5 --max-time 10 "$url" 2>/dev/null)"; then
+      continue
+    fi
 
     # 裸 IP 响应体，例如 https://api.ipify.org。
     ip="$(printf '%s' "$raw" | tr -d '[:space:]')"

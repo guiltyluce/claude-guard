@@ -4,15 +4,18 @@
 
 ## Unreleased
 
-- 出口 IP 探测改为默认使用 `api.anthropic.com/cdn-cgi/trace`，回退到
-  `claude.ai/cdn-cgi/trace`，不再默认依赖 `ipinfo.io` / `api.ipify.org`。
-  按规则分流的代理（Clash、Mihomo、Surge 等）依目标域名选择出站策略，第三方查询域名
-  通常落到兜底策略，导致探测到的出口与 Claude 实际使用的出口无关，白名单校验因此
-  失去意义（既可能误拒，也可能漏过真实漂移）。
+- 出口 IP 探测改为默认只使用 `api.anthropic.com/cdn-cgi/trace`，不再默认依赖
+  `ipinfo.io` / `api.ipify.org`。按规则分流的代理（Clash、Mihomo、Surge 等）依目标
+  域名选择出站策略，第三方查询域名通常落到兜底策略，导致探测到的出口与 Claude 实际
+  使用的出口无关，白名单校验因此失去意义（既可能误拒，也可能漏过真实漂移）。
+  默认不配兜底域名：换个 hostname 再问一次不再满足「与 API 流量同策略」这个前提，
+  主端点探不到时的正确行为是 fail-closed。
 - `get_current_ip_once` 同时接受裸 IP 响应体和 `/cdn-cgi/trace` 的 `key=value` 格式，
   用户仍可通过 `CLAUDE_GUARD_IP_CHECK_URLS` 覆盖为任意查询源。
-- 新增 `tests/ip_probe_format.sh`，覆盖两种响应体格式、默认值以及 trace 解析结果
-  不在白名单时仍然 fail-closed。
+- `get_current_ip_once` 不再忽略 curl 的退出状态：curl 因 `--max-time` 超时（退出码
+  28）吐出包含 `ip=` 的部分响应体时不再被采信，改为按探测失败处理。
+- 新增 `tests/ip_probe_format.sh`，覆盖两种响应体格式、默认值、单源默认下不触碰
+  `claude.ai`、curl 部分响应加非零退出，以及 trace 解析结果不在白名单时仍然 fail-closed。
 
 ## 2.0.4 - 2026-08-01
 

@@ -88,7 +88,7 @@ run_precheck() {
     cd "$TMP_DIR"
     HOME="$TMP_DIR/home" \
       USER="guard-test" \
-      PATH="$TMP_DIR/bin:$PATH" \
+      PATH="${3:-$TMP_DIR/bin}:$PATH" \
       LANG="en_US.UTF-8" \
       CLAUDE_GUARD_CONFIG="$1" \
       CLAUDE_GUARD_IP_CHECK_URLS="$2" \
@@ -124,5 +124,120 @@ if [ "$status" -ne 4 ]; then
   exit 1
 fi
 grep -q 'IP 检查失败：203.0.113.10' "$TMP_DIR/denied.out"
+
+# 5. 默认配置下主端点探测失败必须 fail-closed（exit 3），且全程不得请求 claude.ai。
+#    默认值是单源的：换个 hostname 再问一次就不再与 API 流量同策略，等于用一条不确定
+#    的链路去判定白名单。用户把两个域名都写进 CLAUDE_GUARD_IP_CHECK_URLS 是主动选择，
+#    不在本用例射程内。
+mkdir -p "$TMP_DIR/bin-trace-fail"
+cat >"$TMP_DIR/bin-trace-fail/curl" <<'EOF'
+#!/usr/bin/env bash
+args="$*"
+printf '%s\n' "$args" >>"$HOME/trace-fail-curl.log"
+
+if printf '%s' "$args" | grep -Eq '(^| )-6( |$)'; then
+  exit 7
+fi
+
+# 主端点探测失败：解析不到主机，无响应体。
+if printf '%s' "$args" | grep -q '/cdn-cgi/trace'; then
+  exit 6
+fi
+
+if printf '%s' "$args" | grep -q 'https://api.anthropic.com/'; then
+  {
+    printf '* CONNECT api.anthropic.com:443 HTTP/1.1\n'
+    printf '* CONNECT tunnel established\n'
+    printf '* SSL certificate verify ok.\n'
+    printf '*  issuer: C=US; O=Google Trust Services; CN=WE1\n'
+  } >&2
+  exit 0
+fi
+
+if printf '%s' "$args" | grep -q 'https://platform.claude.com/'; then
+  {
+    printf '* CONNECT platform.claude.com:443 HTTP/1.1\n'
+    printf '* CONNECT tunnel established\n'
+    printf '* SSL certificate verify ok.\n'
+    printf '*  issuer: C=US; O=Let'\''s Encrypt; CN=YE1\n'
+  } >&2
+  exit 0
+fi
+
+exit 1
+EOF
+chmod +x "$TMP_DIR/bin-trace-fail/curl"
+
+: >"$TMP_DIR/home/trace-fail-curl.log"
+set +e
+run_precheck "$TMP_DIR/allowed.json" "" "$TMP_DIR/bin-trace-fail" >"$TMP_DIR/trace_fail.out" 2>&1
+status=$?
+set -e
+if [ "$status" -ne 3 ]; then
+  printf 'default-URL trace failure returned %s instead of 3\n' "$status" >&2
+  cat "$TMP_DIR/trace_fail.out" >&2
+  exit 1
+fi
+grep -q 'IP 检查失败：无法获取当前出口 IP' "$TMP_DIR/trace_fail.out"
+if grep -q 'claude\.ai' "$TMP_DIR/home/trace-fail-curl.log"; then
+  printf 'default URL list must not fall back to claude.ai\n' >&2
+  cat "$TMP_DIR/home/trace-fail-curl.log" >&2
+  exit 1
+fi
+
+# 6. curl 吐出部分响应体后以 28（--max-time 超时）退出时不得采信该响应体。
+#    这里白名单里正好有部分响应中的那个 IP：一旦采信就会 exit 0 放行，因此本用例
+#    要求 exit 3。
+mkdir -p "$TMP_DIR/bin-partial"
+cat >"$TMP_DIR/bin-partial/curl" <<'EOF'
+#!/usr/bin/env bash
+args="$*"
+
+if printf '%s' "$args" | grep -Eq '(^| )-6( |$)'; then
+  exit 7
+fi
+
+# 超时中断：响应体已经包含完整的 ip= 字段，但 curl 以 28 退出。
+if printf '%s' "$args" | grep -q '/cdn-cgi/trace'; then
+  printf 'fl=1f2\n'
+  printf 'h=api.anthropic.com\n'
+  printf 'ip=203.0.113.10\n'
+  exit 28
+fi
+
+if printf '%s' "$args" | grep -q 'https://api.anthropic.com/'; then
+  {
+    printf '* CONNECT api.anthropic.com:443 HTTP/1.1\n'
+    printf '* CONNECT tunnel established\n'
+    printf '* SSL certificate verify ok.\n'
+    printf '*  issuer: C=US; O=Google Trust Services; CN=WE1\n'
+  } >&2
+  exit 0
+fi
+
+if printf '%s' "$args" | grep -q 'https://platform.claude.com/'; then
+  {
+    printf '* CONNECT platform.claude.com:443 HTTP/1.1\n'
+    printf '* CONNECT tunnel established\n'
+    printf '* SSL certificate verify ok.\n'
+    printf '*  issuer: C=US; O=Let'\''s Encrypt; CN=YE1\n'
+  } >&2
+  exit 0
+fi
+
+exit 1
+EOF
+chmod +x "$TMP_DIR/bin-partial/curl"
+
+set +e
+run_precheck "$TMP_DIR/allowed.json" "" "$TMP_DIR/bin-partial" >"$TMP_DIR/partial.out" 2>&1
+status=$?
+set -e
+if [ "$status" -ne 3 ]; then
+  printf 'partial body with curl exit 28 returned %s instead of 3\n' "$status" >&2
+  cat "$TMP_DIR/partial.out" >&2
+  exit 1
+fi
+grep -q 'IP 检查失败：无法获取当前出口 IP' "$TMP_DIR/partial.out"
 
 printf 'ip probe format ok\n'

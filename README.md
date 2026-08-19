@@ -476,13 +476,18 @@ cp config/safe-claude.example.json ~/.safe-claude-official.json
 
 `203.0.113.0/24` 是文档示例网段。实际使用时请替换成你自己的固定出口 IP 或 CIDR。
 
-出口探测默认打 `api.anthropic.com/cdn-cgi/trace`，而不是第三方 IP 查询服务。原因是
+出口探测默认只打 `api.anthropic.com/cdn-cgi/trace`，而不是第三方 IP 查询服务。原因是
 Clash、Mihomo、Surge 这类按规则分流的代理会依据目标域名选择出站策略：如果探测打的是
 `ipinfo.io`，它很可能落到兜底策略，量到的是另一条线路的出口，和 Claude 实际使用的出口
-无关。用 Anthropic 自己的域名探测，可以保证探测流量与 API 流量命中同一条分流规则。
+无关。打 API 自己的域名，探测流量与 API 流量命中同一条分流策略（在固定／黏性出口下即
+同一出口；策略组是 url-test 或负载均衡时，同一条策略的两次请求仍可能出不同 IP）。
 
-如果要换回第三方查询源，`CLAUDE_GUARD_IP_CHECK_URLS` 同时支持裸 IP 响应体和
-`/cdn-cgi/trace` 的 `key=value` 格式；但请自行确认该域名在你的代理配置里与
+默认不配任何兜底域名。换一个 hostname 再问一次就不再满足「与 API 流量同策略」这个前提，
+拿一条不确定链路的出口去判定白名单，正是这里要避免的问题；主端点探不到时的正确行为是
+fail-closed（退出码 3）。
+
+如果要换回第三方查询源或自行添加兜底，`CLAUDE_GUARD_IP_CHECK_URLS` 同时支持裸 IP 响应体
+和 `/cdn-cgi/trace` 的 `key=value` 格式；但请自行确认这些域名在你的代理配置里与
 `api.anthropic.com` 走同一条策略，否则白名单校验的是错误链路。
 
 客户端身份字段是可选的，但安全入口建议全部填写。更新 Claude Code 时应先离线核对新版本、哈希和签名，再一起更新配置；`v2.0.0` 会把不匹配视为失败，不会静默运行新二进制。
@@ -593,7 +598,7 @@ claude-cc --launcher-version
 CLAUDE_GUARD_CONFIG=~/.safe-claude-official.json
 CLAUDE_GUARD_SETTINGS=~/.claude-official/settings.json
 CLAUDE_GUARD_PROXY=http://127.0.0.1:7897
-CLAUDE_GUARD_IP_CHECK_URLS="https://api.anthropic.com/cdn-cgi/trace https://claude.ai/cdn-cgi/trace"
+CLAUDE_GUARD_IP_CHECK_URLS="https://api.anthropic.com/cdn-cgi/trace"
 CLAUDE_GUARD_ASSUME_YES=1
 CLAUDE_GUARD_WATCHDOG=1
 CLAUDE_GUARD_WATCHDOG_DRY_RUN=1

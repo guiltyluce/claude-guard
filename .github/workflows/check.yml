@@ -5,11 +5,25 @@ on:
   pull_request:
 
 jobs:
-  shell-checks:
-    runs-on: ubuntu-latest
+  tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - name: Install dependencies
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y jq curl
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: command -v jq >/dev/null 2>&1 || brew install jq
+      # 门禁必须跑在系统自带的 bash 上。仓库里所有脚本都是 #!/usr/bin/env bash，按
+      # PATH 解析；macOS runner 的 PATH 里通常有 Homebrew bash 5.x，直接跑
+      # ./scripts/check.sh 会解析到它，于是「加了 macOS」只是换台机器跑同一套 bash 5。
+      # macOS 系统 /bin/bash 是 3.2.57，这才是需要门禁盯住的那一个。
+      - name: Show system bash version
+        run: /bin/bash --version | head -1
       - name: Run checks
-        run: ./scripts/check.sh
+        run: /bin/bash ./scripts/check.sh

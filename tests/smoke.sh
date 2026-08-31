@@ -22,8 +22,8 @@ fi
 
 CLAUDE_GUARD_PREFIX="$TMP_DIR/prefix" "$ROOT_DIR/scripts/install-entrypoint-shims.sh" >/tmp/claude-guard-install.out 2>&1
 grep -q '入口已收敛' /tmp/claude-guard-install.out
-grep -q 'exec "'$TMP_DIR'/prefix/bin/claude-guard" "$@"' "$TMP_DIR/prefix/bin/claude"
-grep -q 'exec "'$TMP_DIR'/prefix/bin/claude-guard" "$@"' "$TMP_DIR/prefix/bin/claude-official"
+grep -q 'exec "'"$TMP_DIR"'/prefix/bin/claude-guard" "$@"' "$TMP_DIR/prefix/bin/claude"
+grep -q 'exec "'"$TMP_DIR"'/prefix/bin/claude-guard" "$@"' "$TMP_DIR/prefix/bin/claude-official"
 
 CLAUDE_GUARD_PREFIX="$TMP_DIR/cc-prefix" "$ROOT_DIR/scripts/install-cc-entrypoint.sh" >/tmp/claude-cc-install.out 2>&1
 grep -q 'CC Switch 入口' /tmp/claude-cc-install.out
@@ -42,6 +42,7 @@ if CLAUDE_GUARD_CONFIG="$TMP_DIR/relative-command.json" "$ROOT_DIR/bin/claude-gu
 fi
 grep -q '必须是原始 Claude CLI 的绝对路径' /tmp/claude-guard-test.out
 
+# shellcheck disable=SC2016  # 指纹 fixture 必须写入字面量 ${n} / ${r}，展开后就不再是被检测的那段内容
 printf '#!/usr/bin/env bash\n# Asia/Shanghai\n# Asia/Urumqi\n# Today${n}s date is ${r}.\nprintf fake-claude\\n\n' > "$TMP_DIR/fingerprint-claude"
 chmod +x "$TMP_DIR/fingerprint-claude"
 printf '{"command":"%s","allowed_ips":["1.2.3.4"]}\n' "$TMP_DIR/fingerprint-claude" > "$TMP_DIR/fingerprint-config.json"
@@ -89,6 +90,7 @@ grep -q 'strict 模式拒绝启动' /tmp/claude-guard-test.out
 
 mkdir -p "$TMP_DIR/npm/@anthropic-ai/claude-code/bin" "$TMP_DIR/npm/@anthropic-ai/claude-code-darwin-arm64"
 printf '#!/usr/bin/env bash\nprintf wrapper\\n\n' > "$TMP_DIR/npm/@anthropic-ai/claude-code/bin/claude.exe"
+# shellcheck disable=SC2016  # 指纹 fixture 必须写入字面量 ${n} / ${r}，展开后就不再是被检测的那段内容
 printf '#!/usr/bin/env bash\n# Asia/Shanghai\n# Asia/Urumqi\n# Today${n}s date is ${r}.\nprintf platform\\n\n' > "$TMP_DIR/npm/@anthropic-ai/claude-code-darwin-arm64/claude"
 chmod +x "$TMP_DIR/npm/@anthropic-ai/claude-code/bin/claude.exe" "$TMP_DIR/npm/@anthropic-ai/claude-code-darwin-arm64/claude"
 printf '{"command":"%s","allowed_ips":["1.2.3.4"]}\n' "$TMP_DIR/npm/@anthropic-ai/claude-code/bin/claude.exe" > "$TMP_DIR/wrapper-config.json"

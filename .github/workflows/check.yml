@@ -28,3 +28,32 @@ jobs:
         run: /bin/bash --version | head -1
       - name: Run checks
         run: /bin/bash ./scripts/check.sh
+
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # 固定版本 + 校验官方产物摘要。不用 apt 的浮动版本，也不用未固定的第三方
+      # Action：ShellCheck 升级会带来新规则，浮动版本会让门禁在没人改代码的情况下
+      # 凭空变红，而未固定的 Action 等于把门禁的执行权交给别人的 tag。
+      - name: Install ShellCheck (pinned + checksum verified)
+        env:
+          SHELLCHECK_VERSION: v0.11.0
+          SHELLCHECK_SHA256: 8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198
+        run: |
+          url="https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+          curl -fsSL --retry 3 -o /tmp/shellcheck.tar.xz "$url"
+          echo "${SHELLCHECK_SHA256}  /tmp/shellcheck.tar.xz" | sha256sum -c -
+          tar -xJf /tmp/shellcheck.tar.xz -C /tmp
+          sudo install -m 0755 "/tmp/shellcheck-${SHELLCHECK_VERSION}/shellcheck" /usr/local/bin/shellcheck
+      - name: Show ShellCheck version
+        run: shellcheck --version
+      - name: Run ShellCheck
+        run: |
+          # 覆盖全部受 Git 管理的 shell 文件，含两个无 .sh 后缀的入口
+          # bin/claude-guard 与 bin/claude-cc。
+          git ls-files 'bin/*' 'scripts/*.sh' 'tests/*.sh' | tee /tmp/sc-files.txt
+          # -S style 是最低严重级别，info 与 style 一并拦下——不留「先记着以后再说」
+          # 的空间；-x 跟随 source。豁免必须逐行写在源码里并注明理由，不做全局豁免。
+          # 走 xargs 保持参数边界，路径含空格时不失真。
+          xargs shellcheck -x -S style < /tmp/sc-files.txt

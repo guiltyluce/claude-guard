@@ -7,7 +7,7 @@ Claude 守护是一套 Claude Code 双通道版本与启动策略。它让官方
 通道保持严格、可审计和固定版本，同时允许本机 CC Switch 通道独立跟进较新的
 Claude Code 工程能力。两条通道共享客户端形态，但不共享 profile 和路由。
 
-当前版本：`2.1.3`
+当前版本：`2.1.3`（完整版本历史见文末[版本历史](#版本历史)）
 
 > 本项目不是 Anthropic 或 Claude Code 官方项目。
 
@@ -114,6 +114,341 @@ Claude 守护只做本地启动前检查和 dry-run 观察。它不做：
 - 风控标记清洗、归因字段移除或封禁规避。
 
 请只在符合服务条款和本地法规的场景中使用。守门程序只能降低本机配置和进程生命周期风险，不能保证账号不会被限制，也不能把换号绕过封禁变成合规行为。
+
+## 平台支持
+
+| 平台 | 状态 | 说明 |
+| --- | --- | --- |
+| macOS | 已验证 | 开发与回归测试环境 |
+| Linux | 预期可用 | 需要把 `CLAUDE_GUARD_CA_CERT` 指向本机 CA bundle，默认值 `/etc/ssl/cert.pem` 是 macOS 路径 |
+| Windows（原生） | 不支持 | 见下 |
+
+Windows 原生 curl（以及任何使用 Schannel TLS 后端的 curl）跑不了启动门禁的 TLS 检查。
+原因不是某个字符串没匹配上：`check_tls_host` 要从 curl 的 verbose 输出里读出证书的
+`issuer:`，再拿它匹配 Charles、Fiddler、Zscaler 这类 MITM 特征——TLS 预检存在的理由就是
+这个检查。Schannel 既不打印 `SSL certificate verify ok`，也不打印 `issuer:`，所以放宽匹配
+并不能恢复检查，只会把这一步变成什么都不查的空步骤。因此这里选择明确报错，不做静默降级。
+
+判断方法：`curl -V`，第一行末尾会写 SSL 后端。如果是 `Schannel`，有两条路：
+
+**1）改用 OpenSSL 编译的 curl。** 一律**以 `curl -V` 的实际输出为准**，不要按二进制的
+来源推断：社区反馈 Git for Windows 自带的 `mingw64\bin\curl.exe` 在部分版本上同样是
+Schannel 后端，因此仅仅调整 PATH 顺序并不保证换到 OpenSSL。换完请重新跑一次 `curl -V`
+确认。
+
+换到 OpenSSL 后还有一个坑：Schannel 会忽略 `SSL_CERT_FILE`，OpenSSL 不会。请把
+`CLAUDE_GUARD_CA_CERT` 指向一份真实的 CA bundle，Git for Windows 一般在
+`C:\Program Files\Git\mingw64\etc\ssl\certs\ca-bundle.crt`。
+
+**2）用 WSL2。** 两处要额外配：
+
+- 代理：WSL2 有独立网络命名空间，里面的 `127.0.0.1:7897` 不是 Windows 上的 Clash。
+  要么在 `.wslconfig` 里开 `networkingMode=mirrored`（Windows 11），要么在 Clash 开
+  「允许局域网连接」后设
+  `CLAUDE_GUARD_PROXY=http://$(ip route show default | awk '{print $3}'):7897`。
+- CA：`CLAUDE_GUARD_CA_CERT=/etc/ssl/certs/ca-certificates.crt`。
+
+两条路都不要在安全配置里填 `client_macos_team_id`——签名校验走 macOS `codesign`，
+在非 Darwin 平台会直接判失败。
+
+## 安装
+
+```bash
+./scripts/install.sh
+```
+
+默认安装到：
+
+```bash
+~/.local/bin/claude-guard
+```
+
+如果要把日常入口也收敛到同一套 guard：
+
+```bash
+./scripts/install-entrypoint-shims.sh
+```
+
+它会安装或更新：
+
+```bash
+~/.local/bin/claude
+~/.local/bin/claude-official
+```
+
+两个入口都会先进入 `~/.local/bin/claude-guard`。安装前会自动备份旧入口，默认备份后缀会跟随当前版本，例如 `.bak-before-claude-guard-v2.0.0`。
+
+`v0.2.2` 只负责入口收敛；`v0.2.1` 负责客户端指纹 tripwire。这样两个风险边界分开，后续回滚也更清楚。
+
+安装独立 CC Switch 入口：
+
+```bash
+./scripts/install-cc-entrypoint.sh
+```
+
+它只安装 `~/.local/bin/claude-cc`，不会修改 `claude`、官方 profile 或 CC Switch
+应用本身。
+
+## 配置
+
+### 官方通道
+
+复制示例配置：
+
+```bash
+cp config/safe-claude.example.json ~/.safe-claude-official.json
+```
+
+然后把 `command` 改成原始 Claude CLI 的绝对路径，不能写 `claude`，也不能写当前 wrapper 路径，否则会递归。
+
+示例：
+
+```json
+{
+  "command": "/usr/local/bin/claude",
+  "config_dir": "/Users/your-name/.claude-official",
+  "allowed_ips": ["203.0.113.10"],
+  "allowed_cidrs": ["203.0.113.0/24"],
+  "client_version": "2.1.220",
+  "client_sha256": "<replace-with-the-reviewed-binary-sha256>",
+  "client_macos_team_id": "Q6L2SF6YDW",
+  "blocked_plugins": ["codex@openai-codex"],
+  "blocked_models": [],
+  "require_unpinned_model": false,
+  "notify": false
+}
+```
+
+`203.0.113.0/24` 是文档示例网段。实际使用时请替换成你自己的固定出口 IP 或 CIDR。
+
+出口探测默认只打 `api.anthropic.com/cdn-cgi/trace`，而不是第三方 IP 查询服务。原因是
+Clash、Mihomo、Surge 这类按规则分流的代理会依据目标域名选择出站策略：如果探测打的是
+`ipinfo.io`，它很可能落到兜底策略，量到的是另一条线路的出口，和 Claude 实际使用的出口
+无关。打 API 自己的域名，探测流量与 API 流量命中同一条分流策略（在固定／黏性出口下即
+同一出口；策略组是 url-test 或负载均衡时，同一条策略的两次请求仍可能出不同 IP）。
+
+默认不配任何兜底域名。换一个 hostname 再问一次就不再满足「与 API 流量同策略」这个前提，
+拿一条不确定链路的出口去判定白名单，正是这里要避免的问题；主端点探不到时的正确行为是
+fail-closed（退出码 3）。
+
+如果要换回第三方查询源或自行添加兜底，`CLAUDE_GUARD_IP_CHECK_URLS` 同时支持裸 IP 响应体
+和 `/cdn-cgi/trace` 的 `key=value` 格式；但请自行确认这些域名在你的代理配置里与
+`api.anthropic.com` 走同一条策略，否则白名单校验的是错误链路。
+
+客户端身份字段是可选的，但安全入口建议全部填写。更新 Claude Code 时应先离线核对新版本、哈希和签名，再一起更新配置；`v2.0.0` 会把不匹配视为失败，不会静默运行新二进制。
+
+`blocked_models` 只用于阻止你明确知道不能进入官方通道的本地 alias。保持空数组
+时，Guard 不猜测模型是否存在；模型选择器和服务端负责最终校验。
+
+`require_unpinned_model` 默认建议为 `false`，让客户端升级只更换内核，不同时
+改动已经稳定使用的模型设置。需要专门测试新版默认模型选择时才设为 `true`；
+如需单次指定模型，使用 `claude --model <name>`。
+
+`notify` 默认 `false`。设为 `true` 后，macOS 会在 dry-run watchdog 记录
+would-pause / would-resume 状态转换时发送通知；它不会改变进程状态，也不会向
+Claude Code TUI 写入内容。环境变量 `CLAUDE_GUARD_NOTIFY=0|1` 的优先级更高。
+
+官方 profile 还必须合并 [`config/official-settings-lifecycle.example.json`](config/official-settings-lifecycle.example.json) 中的生命周期字段。不要直接覆盖自己的权限等其他设置。
+
+### CC Switch 通道
+
+复制示例配置：
+
+```bash
+cp config/safe-claude-cc.example.json ~/.safe-claude-cc.json
+```
+
+必须填写：
+
+- `command`：经过验包的 Claude Code 客户端绝对路径。
+- `config_dir`：CC Switch 专用 profile，通常是 `~/.claude` 的绝对路径。
+- `expected_base_url`：CC Switch 的本机 loopback endpoint。
+- `client_version`、`client_sha256`：当前批准使用的客户端身份。
+- macOS 建议同时固定 `client_macos_team_id=Q6L2SF6YDW`。
+- macOS 建议固定 CC Switch 的执行路径、Team ID、Bundle ID 和应用版本。
+- 使用无模型请求的 `OPTIONS /v1/messages` 协议探针，不只检查根路径能否返回。
+
+默认还会要求 `PROXY_MANAGED` token 模式、profile 中不存在
+`.credentials.json`，并检查本机 endpoint 可达。
+
+## 使用
+
+离线查看当前会话、watchdog 覆盖和最近历史：
+
+```bash
+claude-guard status
+claude-guard status --json
+```
+
+运行完整官方链路检查并追加状态快照，不启动 Claude：
+
+```bash
+claude-guard doctor
+```
+
+生成适合分享的离线脱敏诊断摘要：
+
+```bash
+claude-guard diagnose
+```
+
+`status` 和 `diagnose` 不访问网络。`doctor` 会执行与正常启动相同的 IP、TLS、
+IPv6 和配置检查，但不会启动 Claude Code，也不会提交 prompt。
+
+官方通道只做预检，不启动 Claude：
+
+```bash
+claude-guard --precheck-only
+```
+
+预检通过后启动官方 Claude Code：
+
+```bash
+claude-guard
+```
+
+传递 Claude 参数：
+
+```bash
+claude-guard --model opus
+```
+
+CC Switch 通道只做预检：
+
+```bash
+claude-cc --precheck-only
+```
+
+启动 CC Switch 通道：
+
+```bash
+claude-cc
+```
+
+查看实际 CC 客户端版本：
+
+```bash
+claude-cc --version
+```
+
+查看 launcher 自身版本：
+
+```bash
+claude-cc --launcher-version
+```
+
+## 关键环境变量
+
+```bash
+CLAUDE_GUARD_CONFIG=~/.safe-claude-official.json
+CLAUDE_GUARD_SETTINGS=~/.claude-official/settings.json
+CLAUDE_GUARD_PROXY=http://127.0.0.1:7897
+CLAUDE_GUARD_IP_CHECK_URLS="https://api.anthropic.com/cdn-cgi/trace"
+CLAUDE_GUARD_ASSUME_YES=1
+CLAUDE_GUARD_WATCHDOG=1
+CLAUDE_GUARD_WATCHDOG_DRY_RUN=1
+CLAUDE_GUARD_RECOVERY_INTERVAL=30
+CLAUDE_GUARD_DRY_RUN_STDERR=0
+CLAUDE_GUARD_NOTIFY=0
+CLAUDE_GUARD_FINGERPRINT_MODE=fail-active
+CLAUDE_GUARD_LEGACY_PROFILE_MODE=warn
+CLAUDE_GUARD_LOG_FILE=~/.claude-guard/guard.log
+CLAUDE_GUARD_LOG_MAX_BYTES=1048576
+```
+
+## 生命周期 Fail-Closed
+
+官方通道从 `v2.1.1` 起默认要求：
+
+- `claude agents`、`--bg`、`/background` 和 on-demand supervisor 关闭。
+- 当前 TUI 内的 Bash/subagent 后台任务、`run_in_background` 和 `Ctrl+B` 可用；
+  它们必须随前台 TUI 退出而终止。
+- cron、dynamic workflows、Remote Control 和 deep-link registration 关闭。
+- MCP 长调用的自动后台化关闭。
+- 自动更新和手动自更新关闭，由维护者先验包后再更新固定版本。
+- `CLAUDE_CODE_RETRY_WATCHDOG` 必须不存在，避免无人值守时持续数小时重试。
+- 子代理嵌套深度为 `1`，同时运行上限为 `3`。
+- 所有 hooks 暂停，避免第三方 hook 在终端退出期间派生独立进程。
+
+这些设置来自 Claude Code 的公开配置接口，不改写请求、不伪装客户端，也不绕过保护措施。代价是不能使用脱离 TUI 的后台 session、Remote Control、dynamic workflows 和 hooks；普通前台交互、内置工具与受限的前台/后台子代理仍可使用。
+
+当前官方 profile 中的 `codex@openai-codex` 插件包含 detached broker/background worker，因此建议列入 `blocked_plugins` 并在该 profile 中关闭。Codex App、Codex CLI 和 `claude-cc` 不受影响。
+
+## 客户端指纹 Tripwire
+
+`v0.2.1` 新增客户端指纹预检。它不会转发、修改、清洗或拦截 Claude Code 请求，只做启动前风险判断。
+
+默认模式是：
+
+```bash
+CLAUDE_GUARD_FINGERPRINT_MODE=fail-active
+```
+
+含义：
+
+- 如果当前 Claude Code 包没有已知 date/time watermark 逻辑，直接通过。
+- 如果包含有已知逻辑，但官方启动环境干净，只给警告并继续。
+- 如果包含有已知逻辑，且当前环境存在 `ANTHROPIC_BASE_URL` 或 `Asia/Shanghai` / `Asia/Urumqi` 等激活条件，则拒绝启动。
+
+可选模式：
+
+- `off`：关闭该检查。
+- `warn`：只警告，不拒绝。
+- `fail-active`：默认值，只在激活条件存在时拒绝。
+- `strict`：只要客户端含有已知逻辑就拒绝。
+
+`CLAUDE_GUARD_LEGACY_PROFILE_MODE=warn` 会检查 `~/.claude/settings.json` 的旧 CC Switch 残留并提示，但不会阻断官方入口，因为官方入口使用配置指定的独立 profile。
+
+## 当前边界
+
+运行中 guardian 仍然只做 dry-run，不会真的暂停、恢复或 kill 正在运行的 Claude Code。
+
+这是有意为之：当前 launcher 保持 Claude Code 作为前台 TUI 运行，不能安全地只暂停主 PID。真正 action mode 必须暂停整个 Claude 进程组，否则子进程可能继续执行或联网。`v2.0.0` 仍会在用户设置 `CLAUDE_GUARD_WATCHDOG_DRY_RUN=0` 时拒绝启动 action mode，而不是给出虚假的安全感。
+
+在背景功能关闭的情况下，正常前台 Claude 随终端退出；真实 pause/resume 或官方 `processWrapper` 支持会作为独立版本评估。
+
+## 验证
+
+```bash
+./scripts/check.sh
+```
+
+当前测试覆盖：
+
+- shell 语法检查。
+- `--version` 输出。
+- `--help` 输出。
+- 入口 shim 安装路径。
+- 缺失配置失败路径。
+- `command` 非绝对路径失败路径。
+- 客户端指纹 tripwire active/strict 失败路径。
+- 生命周期必需设置失败路径。
+- `CLAUDE_CODE_RETRY_WATCHDOG` 拒绝路径。
+- 客户端版本和 SHA-256 不匹配失败路径。
+- 已知 detached 插件拒绝路径。
+- 项目级官方路由覆盖拒绝路径。
+- 命令行 settings/background 绕过拒绝路径。
+- IP 检查备用源 fallback。
+- `allowed_cidrs` 放行路径。
+- dry-run guardian 状态机。
+- paused 状态探测退避、IP 状态分类、PID 日志归因和恢复路径集成测试。
+- 并发安全的日志轮转。
+- 离线 `status`、JSON 状态、`doctor`、脱敏 `diagnose` 和通知去重。
+- 模拟前台 Claude 退出后 watchdog sidecar 在限定时间内退出。
+- CC Switch 客户端版本、SHA-256 与签章固定。
+- CC Switch loopback endpoint 和 `PROXY_MANAGED` profile 固定。
+- CC Switch 监听进程路径与协议探针拒绝路径。
+- CC profile 官方 credentials 污染拒绝路径。
+- CC 项目设置、CLI settings 与父进程环境污染拒绝路径。
+- 官方版本化 profile、模型取消固定和未授权 IP 不可绕过。
+
+版本切换后还应运行一次不发模型请求的实机 PTY 验收：
+
+```bash
+python3 scripts/verify-terminal-exit.py
+```
+
+它会启动 `--safe-mode` TUI、关闭伪终端并检查残留进程；不会提交 prompt。
 
 ## 版本历史
 
@@ -498,338 +833,3 @@ watchdog 或 Claude Code 启动参数。
 - 不做运行中监控。
 - 不管理 Claude Code 进程生命周期。
 - 不替代用户的代理、VPN 或 Clash/Mihomo 配置。
-
-## 平台支持
-
-| 平台 | 状态 | 说明 |
-| --- | --- | --- |
-| macOS | 已验证 | 开发与回归测试环境 |
-| Linux | 预期可用 | 需要把 `CLAUDE_GUARD_CA_CERT` 指向本机 CA bundle，默认值 `/etc/ssl/cert.pem` 是 macOS 路径 |
-| Windows（原生） | 不支持 | 见下 |
-
-Windows 原生 curl（以及任何使用 Schannel TLS 后端的 curl）跑不了启动门禁的 TLS 检查。
-原因不是某个字符串没匹配上：`check_tls_host` 要从 curl 的 verbose 输出里读出证书的
-`issuer:`，再拿它匹配 Charles、Fiddler、Zscaler 这类 MITM 特征——TLS 预检存在的理由就是
-这个检查。Schannel 既不打印 `SSL certificate verify ok`，也不打印 `issuer:`，所以放宽匹配
-并不能恢复检查，只会把这一步变成什么都不查的空步骤。因此这里选择明确报错，不做静默降级。
-
-判断方法：`curl -V`，第一行末尾会写 SSL 后端。如果是 `Schannel`，有两条路：
-
-**1）改用 OpenSSL 编译的 curl。** 一律**以 `curl -V` 的实际输出为准**，不要按二进制的
-来源推断：社区反馈 Git for Windows 自带的 `mingw64\bin\curl.exe` 在部分版本上同样是
-Schannel 后端，因此仅仅调整 PATH 顺序并不保证换到 OpenSSL。换完请重新跑一次 `curl -V`
-确认。
-
-换到 OpenSSL 后还有一个坑：Schannel 会忽略 `SSL_CERT_FILE`，OpenSSL 不会。请把
-`CLAUDE_GUARD_CA_CERT` 指向一份真实的 CA bundle，Git for Windows 一般在
-`C:\Program Files\Git\mingw64\etc\ssl\certs\ca-bundle.crt`。
-
-**2）用 WSL2。** 两处要额外配：
-
-- 代理：WSL2 有独立网络命名空间，里面的 `127.0.0.1:7897` 不是 Windows 上的 Clash。
-  要么在 `.wslconfig` 里开 `networkingMode=mirrored`（Windows 11），要么在 Clash 开
-  「允许局域网连接」后设
-  `CLAUDE_GUARD_PROXY=http://$(ip route show default | awk '{print $3}'):7897`。
-- CA：`CLAUDE_GUARD_CA_CERT=/etc/ssl/certs/ca-certificates.crt`。
-
-两条路都不要在安全配置里填 `client_macos_team_id`——签名校验走 macOS `codesign`，
-在非 Darwin 平台会直接判失败。
-
-## 安装
-
-```bash
-./scripts/install.sh
-```
-
-默认安装到：
-
-```bash
-~/.local/bin/claude-guard
-```
-
-如果要把日常入口也收敛到同一套 guard：
-
-```bash
-./scripts/install-entrypoint-shims.sh
-```
-
-它会安装或更新：
-
-```bash
-~/.local/bin/claude
-~/.local/bin/claude-official
-```
-
-两个入口都会先进入 `~/.local/bin/claude-guard`。安装前会自动备份旧入口，默认备份后缀会跟随当前版本，例如 `.bak-before-claude-guard-v2.0.0`。
-
-`v0.2.2` 只负责入口收敛；`v0.2.1` 负责客户端指纹 tripwire。这样两个风险边界分开，后续回滚也更清楚。
-
-安装独立 CC Switch 入口：
-
-```bash
-./scripts/install-cc-entrypoint.sh
-```
-
-它只安装 `~/.local/bin/claude-cc`，不会修改 `claude`、官方 profile 或 CC Switch
-应用本身。
-
-## 配置
-
-### 官方通道
-
-复制示例配置：
-
-```bash
-cp config/safe-claude.example.json ~/.safe-claude-official.json
-```
-
-然后把 `command` 改成原始 Claude CLI 的绝对路径，不能写 `claude`，也不能写当前 wrapper 路径，否则会递归。
-
-示例：
-
-```json
-{
-  "command": "/usr/local/bin/claude",
-  "config_dir": "/Users/your-name/.claude-official",
-  "allowed_ips": ["203.0.113.10"],
-  "allowed_cidrs": ["203.0.113.0/24"],
-  "client_version": "2.1.220",
-  "client_sha256": "<replace-with-the-reviewed-binary-sha256>",
-  "client_macos_team_id": "Q6L2SF6YDW",
-  "blocked_plugins": ["codex@openai-codex"],
-  "blocked_models": [],
-  "require_unpinned_model": false,
-  "notify": false
-}
-```
-
-`203.0.113.0/24` 是文档示例网段。实际使用时请替换成你自己的固定出口 IP 或 CIDR。
-
-出口探测默认只打 `api.anthropic.com/cdn-cgi/trace`，而不是第三方 IP 查询服务。原因是
-Clash、Mihomo、Surge 这类按规则分流的代理会依据目标域名选择出站策略：如果探测打的是
-`ipinfo.io`，它很可能落到兜底策略，量到的是另一条线路的出口，和 Claude 实际使用的出口
-无关。打 API 自己的域名，探测流量与 API 流量命中同一条分流策略（在固定／黏性出口下即
-同一出口；策略组是 url-test 或负载均衡时，同一条策略的两次请求仍可能出不同 IP）。
-
-默认不配任何兜底域名。换一个 hostname 再问一次就不再满足「与 API 流量同策略」这个前提，
-拿一条不确定链路的出口去判定白名单，正是这里要避免的问题；主端点探不到时的正确行为是
-fail-closed（退出码 3）。
-
-如果要换回第三方查询源或自行添加兜底，`CLAUDE_GUARD_IP_CHECK_URLS` 同时支持裸 IP 响应体
-和 `/cdn-cgi/trace` 的 `key=value` 格式；但请自行确认这些域名在你的代理配置里与
-`api.anthropic.com` 走同一条策略，否则白名单校验的是错误链路。
-
-客户端身份字段是可选的，但安全入口建议全部填写。更新 Claude Code 时应先离线核对新版本、哈希和签名，再一起更新配置；`v2.0.0` 会把不匹配视为失败，不会静默运行新二进制。
-
-`blocked_models` 只用于阻止你明确知道不能进入官方通道的本地 alias。保持空数组
-时，Guard 不猜测模型是否存在；模型选择器和服务端负责最终校验。
-
-`require_unpinned_model` 默认建议为 `false`，让客户端升级只更换内核，不同时
-改动已经稳定使用的模型设置。需要专门测试新版默认模型选择时才设为 `true`；
-如需单次指定模型，使用 `claude --model <name>`。
-
-`notify` 默认 `false`。设为 `true` 后，macOS 会在 dry-run watchdog 记录
-would-pause / would-resume 状态转换时发送通知；它不会改变进程状态，也不会向
-Claude Code TUI 写入内容。环境变量 `CLAUDE_GUARD_NOTIFY=0|1` 的优先级更高。
-
-官方 profile 还必须合并 [`config/official-settings-lifecycle.example.json`](config/official-settings-lifecycle.example.json) 中的生命周期字段。不要直接覆盖自己的权限等其他设置。
-
-### CC Switch 通道
-
-复制示例配置：
-
-```bash
-cp config/safe-claude-cc.example.json ~/.safe-claude-cc.json
-```
-
-必须填写：
-
-- `command`：经过验包的 Claude Code 客户端绝对路径。
-- `config_dir`：CC Switch 专用 profile，通常是 `~/.claude` 的绝对路径。
-- `expected_base_url`：CC Switch 的本机 loopback endpoint。
-- `client_version`、`client_sha256`：当前批准使用的客户端身份。
-- macOS 建议同时固定 `client_macos_team_id=Q6L2SF6YDW`。
-- macOS 建议固定 CC Switch 的执行路径、Team ID、Bundle ID 和应用版本。
-- 使用无模型请求的 `OPTIONS /v1/messages` 协议探针，不只检查根路径能否返回。
-
-默认还会要求 `PROXY_MANAGED` token 模式、profile 中不存在
-`.credentials.json`，并检查本机 endpoint 可达。
-
-## 使用
-
-离线查看当前会话、watchdog 覆盖和最近历史：
-
-```bash
-claude-guard status
-claude-guard status --json
-```
-
-运行完整官方链路检查并追加状态快照，不启动 Claude：
-
-```bash
-claude-guard doctor
-```
-
-生成适合分享的离线脱敏诊断摘要：
-
-```bash
-claude-guard diagnose
-```
-
-`status` 和 `diagnose` 不访问网络。`doctor` 会执行与正常启动相同的 IP、TLS、
-IPv6 和配置检查，但不会启动 Claude Code，也不会提交 prompt。
-
-官方通道只做预检，不启动 Claude：
-
-```bash
-claude-guard --precheck-only
-```
-
-预检通过后启动官方 Claude Code：
-
-```bash
-claude-guard
-```
-
-传递 Claude 参数：
-
-```bash
-claude-guard --model opus
-```
-
-CC Switch 通道只做预检：
-
-```bash
-claude-cc --precheck-only
-```
-
-启动 CC Switch 通道：
-
-```bash
-claude-cc
-```
-
-查看实际 CC 客户端版本：
-
-```bash
-claude-cc --version
-```
-
-查看 launcher 自身版本：
-
-```bash
-claude-cc --launcher-version
-```
-
-## 关键环境变量
-
-```bash
-CLAUDE_GUARD_CONFIG=~/.safe-claude-official.json
-CLAUDE_GUARD_SETTINGS=~/.claude-official/settings.json
-CLAUDE_GUARD_PROXY=http://127.0.0.1:7897
-CLAUDE_GUARD_IP_CHECK_URLS="https://api.anthropic.com/cdn-cgi/trace"
-CLAUDE_GUARD_ASSUME_YES=1
-CLAUDE_GUARD_WATCHDOG=1
-CLAUDE_GUARD_WATCHDOG_DRY_RUN=1
-CLAUDE_GUARD_RECOVERY_INTERVAL=30
-CLAUDE_GUARD_DRY_RUN_STDERR=0
-CLAUDE_GUARD_NOTIFY=0
-CLAUDE_GUARD_FINGERPRINT_MODE=fail-active
-CLAUDE_GUARD_LEGACY_PROFILE_MODE=warn
-CLAUDE_GUARD_LOG_FILE=~/.claude-guard/guard.log
-CLAUDE_GUARD_LOG_MAX_BYTES=1048576
-```
-
-## 生命周期 Fail-Closed
-
-官方通道从 `v2.1.1` 起默认要求：
-
-- `claude agents`、`--bg`、`/background` 和 on-demand supervisor 关闭。
-- 当前 TUI 内的 Bash/subagent 后台任务、`run_in_background` 和 `Ctrl+B` 可用；
-  它们必须随前台 TUI 退出而终止。
-- cron、dynamic workflows、Remote Control 和 deep-link registration 关闭。
-- MCP 长调用的自动后台化关闭。
-- 自动更新和手动自更新关闭，由维护者先验包后再更新固定版本。
-- `CLAUDE_CODE_RETRY_WATCHDOG` 必须不存在，避免无人值守时持续数小时重试。
-- 子代理嵌套深度为 `1`，同时运行上限为 `3`。
-- 所有 hooks 暂停，避免第三方 hook 在终端退出期间派生独立进程。
-
-这些设置来自 Claude Code 的公开配置接口，不改写请求、不伪装客户端，也不绕过保护措施。代价是不能使用脱离 TUI 的后台 session、Remote Control、dynamic workflows 和 hooks；普通前台交互、内置工具与受限的前台/后台子代理仍可使用。
-
-当前官方 profile 中的 `codex@openai-codex` 插件包含 detached broker/background worker，因此建议列入 `blocked_plugins` 并在该 profile 中关闭。Codex App、Codex CLI 和 `claude-cc` 不受影响。
-
-## 客户端指纹 Tripwire
-
-`v0.2.1` 新增客户端指纹预检。它不会转发、修改、清洗或拦截 Claude Code 请求，只做启动前风险判断。
-
-默认模式是：
-
-```bash
-CLAUDE_GUARD_FINGERPRINT_MODE=fail-active
-```
-
-含义：
-
-- 如果当前 Claude Code 包没有已知 date/time watermark 逻辑，直接通过。
-- 如果包含有已知逻辑，但官方启动环境干净，只给警告并继续。
-- 如果包含有已知逻辑，且当前环境存在 `ANTHROPIC_BASE_URL` 或 `Asia/Shanghai` / `Asia/Urumqi` 等激活条件，则拒绝启动。
-
-可选模式：
-
-- `off`：关闭该检查。
-- `warn`：只警告，不拒绝。
-- `fail-active`：默认值，只在激活条件存在时拒绝。
-- `strict`：只要客户端含有已知逻辑就拒绝。
-
-`CLAUDE_GUARD_LEGACY_PROFILE_MODE=warn` 会检查 `~/.claude/settings.json` 的旧 CC Switch 残留并提示，但不会阻断官方入口，因为官方入口使用配置指定的独立 profile。
-
-## 当前边界
-
-运行中 guardian 仍然只做 dry-run，不会真的暂停、恢复或 kill 正在运行的 Claude Code。
-
-这是有意为之：当前 launcher 保持 Claude Code 作为前台 TUI 运行，不能安全地只暂停主 PID。真正 action mode 必须暂停整个 Claude 进程组，否则子进程可能继续执行或联网。`v2.0.0` 仍会在用户设置 `CLAUDE_GUARD_WATCHDOG_DRY_RUN=0` 时拒绝启动 action mode，而不是给出虚假的安全感。
-
-在背景功能关闭的情况下，正常前台 Claude 随终端退出；真实 pause/resume 或官方 `processWrapper` 支持会作为独立版本评估。
-
-## 验证
-
-```bash
-./scripts/check.sh
-```
-
-当前测试覆盖：
-
-- shell 语法检查。
-- `--version` 输出。
-- `--help` 输出。
-- 入口 shim 安装路径。
-- 缺失配置失败路径。
-- `command` 非绝对路径失败路径。
-- 客户端指纹 tripwire active/strict 失败路径。
-- 生命周期必需设置失败路径。
-- `CLAUDE_CODE_RETRY_WATCHDOG` 拒绝路径。
-- 客户端版本和 SHA-256 不匹配失败路径。
-- 已知 detached 插件拒绝路径。
-- 项目级官方路由覆盖拒绝路径。
-- 命令行 settings/background 绕过拒绝路径。
-- IP 检查备用源 fallback。
-- `allowed_cidrs` 放行路径。
-- dry-run guardian 状态机。
-- paused 状态探测退避、IP 状态分类、PID 日志归因和恢复路径集成测试。
-- 并发安全的日志轮转。
-- 离线 `status`、JSON 状态、`doctor`、脱敏 `diagnose` 和通知去重。
-- 模拟前台 Claude 退出后 watchdog sidecar 在限定时间内退出。
-- CC Switch 客户端版本、SHA-256 与签章固定。
-- CC Switch loopback endpoint 和 `PROXY_MANAGED` profile 固定。
-- CC Switch 监听进程路径与协议探针拒绝路径。
-- CC profile 官方 credentials 污染拒绝路径。
-- CC 项目设置、CLI settings 与父进程环境污染拒绝路径。
-- 官方版本化 profile、模型取消固定和未授权 IP 不可绕过。
-
-版本切换后还应运行一次不发模型请求的实机 PTY 验收：
-
-```bash
-python3 scripts/verify-terminal-exit.py
-```
-
-它会启动 `--safe-mode` TUI、关闭伪终端并检查残留进程；不会提交 prompt。
